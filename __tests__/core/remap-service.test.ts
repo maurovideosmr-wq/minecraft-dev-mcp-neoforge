@@ -374,4 +374,32 @@ describe('JAR Remapping', () => {
       expect(intermediaryFieldCount).toBeLessThan(20);
     }, 60000);
   });
+
+  describe('Unobfuscated version handling', () => {
+    // 26.1+ snapshots ship without obfuscation — no intermediary or Yarn mappings exist.
+    const UNOBFUSCATED_VERSION = '26.1-snapshot-8';
+
+    it('should throw a clear error when requesting yarn mappings for an unobfuscated version', async () => {
+      const remapService = getRemapService();
+      await expect(remapService.getRemappedJar(UNOBFUSCATED_VERSION, 'yarn')).rejects.toThrow(
+        /yarn mappings are not supported for unobfuscated/i,
+      );
+    }, 60000); // includes client JAR download on first run
+
+    it('should throw a clear error when requesting intermediary mappings for an unobfuscated version', async () => {
+      const remapService = getRemapService();
+      await expect(
+        remapService.getRemappedJar(UNOBFUSCATED_VERSION, 'intermediary'),
+      ).rejects.toThrow(/intermediary mappings are not supported for unobfuscated/i);
+    }, 60000);
+
+    it('should return the raw client JAR for mojmap on an unobfuscated version', async () => {
+      const remapService = getRemapService();
+      const jarPath = await remapService.getRemappedJar(UNOBFUSCATED_VERSION, 'mojmap');
+      expect(jarPath).toBeDefined();
+      expect(existsSync(jarPath)).toBe(true);
+      // The returned path is the raw client JAR, not a remapped copy
+      expect(jarPath).not.toContain('remapped');
+    }, 60000);
+  });
 });

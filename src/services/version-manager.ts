@@ -143,6 +143,18 @@ export class VersionManager {
   }
 
   /**
+   * Check if a Minecraft version ships an unobfuscated JAR.
+   *
+   * Starting with Minecraft 26.1 snapshots, Mojang stopped obfuscating the
+   * client JAR. These versions have no `client_mappings` entry in their
+   * version JSON because there is nothing to reverse-map.
+   */
+  async isVersionUnobfuscated(version: string): Promise<boolean> {
+    const versionJson = await this.downloader.getVersionJson(version);
+    return !versionJson.downloads.client_mappings;
+  }
+
+  /**
    * Get version JAR path (must be cached)
    */
   getCachedJarPath(version: string): string {
