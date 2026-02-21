@@ -382,7 +382,7 @@ describe('JAR Remapping', () => {
       await expect(remapService.getRemappedJar(UNOBFUSCATED_TEST_VERSION, 'yarn')).rejects.toThrow(
         /yarn mappings are not supported for unobfuscated/i,
       );
-    }, 60000); // includes client JAR download on first run
+    }, 60000); // network call to fetch version JSON on first run
 
     it('should throw a clear error when requesting intermediary mappings for an unobfuscated version', async () => {
       const remapService = getRemapService();

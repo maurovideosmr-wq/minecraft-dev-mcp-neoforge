@@ -13,6 +13,11 @@ export class VersionManager {
    * 26.1-snapshot-1 released at this timestamp and removed client obfuscation.
    */
   private static readonly UNOBFUSCATED_CUTOFF_MS = Date.parse('2025-12-16T12:42:29+00:00');
+  /**
+   * Emergency overrides for Mojang metadata anomalies.
+   * Keyed by exact version id from version JSON.
+   */
+  private static readonly UNOBFUSCATED_VERSION_OVERRIDES: Readonly<Record<string, boolean>> = {};
 
   private downloader = getMojangDownloader();
   private cache = getCacheManager();
@@ -151,30 +156,40 @@ export class VersionManager {
   /**
    * Check if a Minecraft version ships an unobfuscated JAR.
    *
-   * Starting with Minecraft 26.1 snapshots, Mojang stopped obfuscating the
-   * client JAR. These versions have no `client_mappings` entry in their
-   * version JSON because there is nothing to reverse-map.
+   * Mojang's authoritative signal is the presence/absence of `client_mappings`
+   * in the version JSON:
+   * - present: obfuscated client JAR (reverse mapping required)
+   * - absent: potentially unobfuscated client JAR
    *
    * Important: some older obfuscated versions (e.g. early 1.14.x) also lack
-   * `client_mappings` metadata, so missing metadata alone is not sufficient.
+   * `client_mappings` metadata, so we also gate by the known 26.1 cutover time.
    */
   async isVersionUnobfuscated(version: string): Promise<boolean> {
     const versionJson = await this.downloader.getVersionJson(version);
+
+    const override = VersionManager.UNOBFUSCATED_VERSION_OVERRIDES[versionJson.id];
+    if (override !== undefined) {
+      logger.warn(
+        `Using unobfuscated override for ${versionJson.id}: ${override ? 'unobfuscated' : 'obfuscated'}`,
+      );
+      return override;
+    }
+
     if (versionJson.downloads.client_mappings) {
       return false;
     }
 
-    // Early 1.14.x releases can be missing client_mappings metadata while still obfuscated.
-    // Treat versions as unobfuscated only after the known 26.1 cutover and only for modern ids.
+    // Early legacy versions can be missing client_mappings while still obfuscated.
+    // Treat missing client_mappings as unobfuscated only at/after the known cutover.
     const releaseTimeMs = Date.parse(versionJson.releaseTime);
-    const isAfterUnobfuscatedCutover =
-      Number.isFinite(releaseTimeMs) && releaseTimeMs >= VersionManager.UNOBFUSCATED_CUTOFF_MS;
+    if (!Number.isFinite(releaseTimeMs)) {
+      logger.warn(
+        `Version ${versionJson.id} has invalid releaseTime '${versionJson.releaseTime}', defaulting to obfuscated`,
+      );
+      return false;
+    }
 
-    const modernVersionId = /^(\d+)\.(\d+)(?:\.\d+)?(?:-snapshot-\d+)?$/.exec(versionJson.id);
-    const modernMajor = modernVersionId ? Number.parseInt(modernVersionId[1], 10) : Number.NaN;
-    const isModernUnobfuscatedSeries = Number.isFinite(modernMajor) && modernMajor >= 26;
-
-    return isAfterUnobfuscatedCutover && isModernUnobfuscatedSeries;
+    return releaseTimeMs >= VersionManager.UNOBFUSCATED_CUTOFF_MS;
   }
 
   /**

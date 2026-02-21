@@ -15,7 +15,6 @@
     "inspect": "npm run build && npx @modelcontextprotocol/inspector node dist/index.js",
     "inspect:dev": "npx @modelcontextprotocol/inspector tsx src/index.ts",
     "test": "vitest",
-    "test:mcp:e2e": "vitest __tests__/mcp",
     "test:ui": "vitest --ui",
     "test:manual": "vitest --config vitest.manual.config.ts",
     "test:manual:mcp": "vitest --config vitest.manual.config.ts __tests__/manual/mcp",

@@ -58,5 +58,17 @@ describe('Version Management', () => {
       const result = await versionManager.isVersionUnobfuscated(UNOBFUSCATED_TEST_VERSION);
       expect(result).toBe(true);
     }, 30000);
+
+    it('should return true for first unobfuscated boundary version (26.1-snapshot-1)', async () => {
+      const versionManager = getVersionManager();
+      const result = await versionManager.isVersionUnobfuscated('26.1-snapshot-1');
+      expect(result).toBe(true);
+    }, 30000);
+
+    it('should return true for newer unobfuscated snapshot versions (26.1-snapshot-9)', async () => {
+      const versionManager = getVersionManager();
+      const result = await versionManager.isVersionUnobfuscated('26.1-snapshot-9');
+      expect(result).toBe(true);
+    }, 30000);
   });
 });

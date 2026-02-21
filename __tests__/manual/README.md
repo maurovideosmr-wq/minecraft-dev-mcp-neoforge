@@ -81,6 +81,9 @@ Example:
 cross-env MCP_E2E_VERSIONS=1.21.11,1.20.1,26.1-snapshot-1,26.1-snapshot-9 npm run test:manual:mcp
 ```
 
+Versions are classified at runtime using Mojang metadata via
+`VersionManager.isVersionUnobfuscated()`, not by hardcoded version-id patterns.
+
 Default matrix includes:
 - `1.21.11`
 - `1.21.10`

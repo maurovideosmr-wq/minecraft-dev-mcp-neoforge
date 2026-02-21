@@ -4,9 +4,23 @@ import {
   createMcpSession,
   extractFirstText,
 } from '../../helpers/mcp-stdio.js';
+import { getVersionManager } from '../../../src/services/version-manager.js';
 import { parseMatrixVersionsFromEnv } from './test-constants.js';
 
-const { obfuscatedVersions, unobfuscatedVersions } = parseMatrixVersionsFromEnv();
+const matrixVersions = parseMatrixVersionsFromEnv();
+const unobfuscatedCache = new Map<string, boolean>();
+
+async function isUnobfuscatedVersion(version: string): Promise<boolean> {
+  const cached = unobfuscatedCache.get(version);
+  if (cached !== undefined) {
+    return cached;
+  }
+
+  const versionManager = getVersionManager();
+  const result = await versionManager.isVersionUnobfuscated(version);
+  unobfuscatedCache.set(version, result);
+  return result;
+}
 
 /**
  * Manual matrix for true MCP stdio E2E validation.
@@ -45,8 +59,10 @@ describe('Manual MCP Stdio Matrix', () => {
     expect(resources.resources.length).toBeGreaterThan(0);
   }, 30000);
 
-  for (const version of obfuscatedVersions) {
-    it(`should decompile ${version} with yarn over stdio`, async () => {
+  for (const version of matrixVersions) {
+    it(`should enforce expected yarn behavior for ${version} over stdio`, async () => {
+      const unobfuscated = await isUnobfuscatedVersion(version);
+
       const result = await session.client.callTool(
         {
           name: 'decompile_minecraft_version',
@@ -60,21 +76,31 @@ describe('Manual MCP Stdio Matrix', () => {
         longRequest,
       );
 
-      expect(result.isError).not.toBe(true);
       const text = extractFirstText(result.content);
-      expect(text).toContain(version);
-      expect(text).toContain('yarn');
-      expect(text).toMatch(/completed|classes/i);
+      if (unobfuscated) {
+        expect(result.isError).toBe(true);
+        expect(text).toContain('mojmap');
+        expect(text).toMatch(/use ['"]mojmap['"] mapping/i);
+      } else {
+        expect(result.isError).not.toBe(true);
+        expect(text).toContain(version);
+        expect(text).toContain('yarn');
+        expect(text).toMatch(/completed|classes/i);
+      }
     }, 900000);
 
-    it(`should return Entity source for ${version} via stdio`, async () => {
+    it(`should return MinecraftServer source for ${version} using the expected mapping over stdio`, async () => {
+      const unobfuscated = await isUnobfuscatedVersion(version);
+      const mapping = unobfuscated ? 'mojmap' : 'yarn';
+      const className = 'net.minecraft.server.MinecraftServer';
+
       const result = await session.client.callTool(
         {
           name: 'get_minecraft_source',
           arguments: {
             version,
-            className: 'net.minecraft.entity.Entity',
-            mapping: 'yarn',
+            className,
+            mapping,
           },
         },
         undefined,
@@ -83,50 +109,7 @@ describe('Manual MCP Stdio Matrix', () => {
 
       expect(result.isError).not.toBe(true);
       const text = extractFirstText(result.content);
-      expect(text).toContain('class Entity');
+      expect(text).toContain('class MinecraftServer');
     }, 600000);
-  }
-
-  for (const unobfuscatedVersion of unobfuscatedVersions) {
-    it(`should reject yarn for unobfuscated ${unobfuscatedVersion} over stdio`, async () => {
-      const result = await session.client.callTool(
-        {
-          name: 'decompile_minecraft_version',
-          arguments: {
-            version: unobfuscatedVersion,
-            mapping: 'yarn',
-            force: false,
-          },
-        },
-        undefined,
-        longRequest,
-      );
-
-      expect(result.isError).toBe(true);
-      const text = extractFirstText(result.content);
-      expect(text).toContain('mojmap');
-      expect(text).toMatch(/use ['"]mojmap['"] mapping/i);
-    }, 120000);
-
-    it(`should decompile unobfuscated ${unobfuscatedVersion} with mojmap over stdio`, async () => {
-      const result = await session.client.callTool(
-        {
-          name: 'decompile_minecraft_version',
-          arguments: {
-            version: unobfuscatedVersion,
-            mapping: 'mojmap',
-            force: false,
-          },
-        },
-        undefined,
-        longRequest,
-      );
-
-      expect(result.isError).not.toBe(true);
-      const text = extractFirstText(result.content);
-      expect(text).toContain(unobfuscatedVersion);
-      expect(text).toContain('mojmap');
-      expect(text).toMatch(/completed|classes/i);
-    }, 900000);
   }
 });
