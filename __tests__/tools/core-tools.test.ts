@@ -572,7 +572,6 @@ describe('Decompile and Remap Tools', () => {
     expect(result.isError).toBe(true);
     const text = result.content[0].text;
     expect(text).toMatch(/unobfuscated/i);
-    expect(text).toMatch(/no mapping translation is needed/i);
   }, 60000);
 
   it('should handle remap_mod_jar with Fabric mod', async () => {

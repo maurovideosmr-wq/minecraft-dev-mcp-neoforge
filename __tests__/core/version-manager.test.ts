@@ -72,21 +72,13 @@ describe('Version Management', () => {
     }, 30000);
 
     // Regression tests for https://github.com/MCDxAI/minecraft-dev-mcp/issues/5
-    it('should return true for 26.1-snapshot-10 (issue #5)', async () => {
+    it.each([
+      '26.1-snapshot-10',
+      '26.1-snapshot-11',
+      '26.1-rc-3',
+    ])('should return true for %s (issue #5)', async (version) => {
       const versionManager = getVersionManager();
-      const result = await versionManager.isVersionUnobfuscated('26.1-snapshot-10');
-      expect(result).toBe(true);
-    }, 30000);
-
-    it('should return true for 26.1-snapshot-11 (issue #5)', async () => {
-      const versionManager = getVersionManager();
-      const result = await versionManager.isVersionUnobfuscated('26.1-snapshot-11');
-      expect(result).toBe(true);
-    }, 30000);
-
-    it('should return true for 26.1-rc-3 (issue #5)', async () => {
-      const versionManager = getVersionManager();
-      const result = await versionManager.isVersionUnobfuscated('26.1-rc-3');
+      const result = await versionManager.isVersionUnobfuscated(version);
       expect(result).toBe(true);
     }, 30000);
   });
