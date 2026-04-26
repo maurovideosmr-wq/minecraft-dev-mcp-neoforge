@@ -2,6 +2,22 @@
 
 Reference for AI/agent operators working in this repo. Grounded in `CLAUDE.md` and current project state.
 
+## This repository (fork)
+
+
+|              |                                                                                                                                                                              |
+| ------------ | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **Fork**     | [maurovideosmr-wq/minecraft-dev-mcp-neoforge](https://github.com/maurovideosmr-wq/minecraft-dev-mcp-neoforge) — NeoForge-oriented additions and defaults on top of upstream. |
+| **Upstream** | [MCDxAI/minecraft-dev-mcp](https://github.com/MCDxAI/minecraft-dev-mcp) — sync with `git fetch upstream` and `git merge upstream/main` (or rebase).                          |
+| **Remotes**  | `origin` → this fork · `upstream` → official (if configured).                                                                                                                |
+
+
+### Compared to upstream [MCDxAI/minecraft-dev-mcp](https://github.com/MCDxAI/minecraft-dev-mcp)
+
+This branch adds **NeoForge-oriented tooling** and related plumbing: `neoforge-downloader` + `neoforge-decompile-service` + NeoForge FTS index; MCP tools `validate_access_transformer`, `decompile_neoforge_api`, `index_neoforge_api`, `search_neoforge_api`; Forge / NeoForge `mods.toml` parsing via `utils/forge-toml-blocks.ts` (wired into mod analysis / mixin paths); `access-transformer-service.ts`; `mixin-config-reader` and mixin service updates; more resilient **Mojang client/server JAR downloads** (SHA-1 verify with retry and cache invalidation on mismatch); default `npm test` uses `**vitest.quick.config.ts`** (offline-friendly); helper script `scripts/redownload-minecraft-server.ts` for re-fetching a server JAR. **CI** (`.github/workflows/test.yml`) runs `**npm run test:integration`** (full heavy suite), not the quick `npm test` default.
+
+Documentation in this repo describes **this fork’s** behavior (e.g. NeoForge API tools, `modLoader: neoforge` → mojmap, `neoforge-downloader` version resolution). When reading issues/PRs on the upstream project, behavior may differ until merged.
+
 ## Project Snapshot
 
 - MCP server that lets agents decompile, remap, search, and analyze Minecraft (1.14+; obfuscated through 1.21.11).
@@ -14,7 +30,7 @@ Reference for AI/agent operators working in this repo. Grounded in `CLAUDE.md` a
 - Keep ESM intact: no CommonJS, ensure `.js` extensions on local imports after build.
 - Registry extraction must use the obfuscated **server JAR** with version-aware bundler flag; never the client JAR.
 - Yarn remapping is two-step: official → intermediary → yarn; do not collapse into one pass.
-- Respect cache layout in platform app data (`jars/`, `mappings/`, `remapped/`, `decompiled/{version}/{mapping}/`, `registry/{version}/`, `resources/`, `search-index/`, `cache.db`).
+- Respect cache layout in platform app data (`jars/`, `mappings/`, `remapped/`, `decompiled/{version}/{mapping}/`, `decompiled-mods/`, `decompiled-neoforge/`, `neoforge/jars/`, `registry/{version}/`, `resources/`, `search_index.db`, `cache.db`).
 - VineFlower drops `libraries/`, `versions/`, `logs/` in CWD during runs; temporary and gitignored.
 
 ## Architecture Wayfinder (src/)
@@ -25,6 +41,7 @@ Reference for AI/agent operators working in this repo. Grounded in `CLAUDE.md` a
 - `cache/`: cache manager + SQLite metadata DB.
 - `utils/paths.ts`: resolves OS-specific cache roots; includes `decompiledNeoforge`, `getDecompiledNeoforgePath`, `getNeoforgeJarPath` for NeoForge API flows.
 - NeoForge: `downloaders/neoforge-downloader`, `services/neoforge-decompile-service`, FTS tables in `search-index-service` (`neoforge_search_index`).
+- Forge/NeoForge JAR metadata: `utils/forge-toml-blocks.ts` (minimal `mods.toml` / `neoforge.mods.toml` parsing); `services/access-transformer-service.ts` (AT validation, distinct from Fabric access widener); `services/mixin-config-reader.ts` (mixin config handling used with `mixin-service`).
 
 ## Available MCP Tools (for LLM surfaces)
 
@@ -37,13 +54,14 @@ Reference for AI/agent operators working in this repo. Grounded in `CLAUDE.md` a
 - **Registry paths**: MC ≥1.21 writes `reports/registries.json`; <1.21 uses `generated/reports/registries.json`. Names are singular (`block`, `item`, `entity`), auto-prefixed with `minecraft:` if absent.
 - **Java invocation**: MC 1.18+ bundler needs `-DbundlerMainClass=net.minecraft.data.Main`; pre-1.18 uses `-cp` mode.
 - **Performance**: first decompile downloads/remaps (~400–500 MB/version). Caching makes subsequent requests near-instant.
-- **Integrity**: downloads are SHA-verified; cache rebuilds on corruption; Java processes run with timeouts and memory caps.
+- **Integrity**: downloads are SHA-verified; client/server JAR downloads retry on SHA-1 mismatch (re-fetch `version.json`, delete bad file). Java processes run with timeouts and memory caps.
 
 ## Testing & Commands
 
-- Default / fast: `npm test` (vitest quick config — no JAR/mapping downloads; OK offline).
-- Full integration (downloads, decompile, registry, cached tool tests): `npm run test:integration`.
-- Manual/versioned suites: `npm run test:manual` (Yarn 1.21.10/1.20.1/1.19.4), `npm run test:manual:mojmap` (+ version-specific overrides).
+- Default / fast: `npm test` (same as `npm run test:quick` — `vitest.quick.config.ts`; excludes integration/manual and tests that download JARs or hit Mojang; OK offline).
+- Full integration (downloads, decompile, registry, end-to-end): `npm run test:integration` (root `vitest.config.ts`).
+- Unit-oriented (no `__tests__/integration/`**): `npm run test:unit`.
+- Manual/versioned suites: `npm run test:manual` (Yarn 1.21.10/1.20.1/1.19.4), `npm run test:manual:mojmap` (+ version-specific overrides), `npm run test:manual:neoforge` (sets `MCP_NEOFORGE_E2E=1` for `__tests__/manual/neoforge-api`).
 - Dev/build: `npm run dev` (tsx watch), `npm run build`, `npm run typecheck`, `npm run lint[:fix]`.
 - Full sweep: `npm run test:all` (integration + manual).
 
