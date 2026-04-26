@@ -6,9 +6,16 @@
 
 ![License](https://img.shields.io/badge/License-MIT-yellow?style=flat) ![Node.js](https://img.shields.io/badge/Node.js-18%2B-339933?style=flat) ![TypeScript](https://img.shields.io/badge/TypeScript-5.7.2-3178c6?style=flat) ![MCP SDK](https://img.shields.io/badge/MCP%20SDK-1.0.4-purple?style=flat) ![Java](https://img.shields.io/badge/Java-17%2B-f97316?style=flat) ![Vitest](https://img.shields.io/badge/Vitest-2.1.8-729B1B?style=flat) ![Biome](https://img.shields.io/badge/Biome-1.9.4-60a5fa?style=flat) ![WSL](https://img.shields.io/badge/WSL-Compatible-0078d4?style=flat)
 
-**20 tools spanning decompilation, mapping translation, mod analysis, mixin validation, version comparison, and full-text search — with full WSL and Windows path support.**
+**24 tools** spanning decompilation, mapping translation, mod analysis, mixin validation, NeoForge API search, access transformers, version comparison, and full-text search — with full WSL and Windows path support.
 
 </div>
+
+### About this repository
+
+| | |
+| --- | --- |
+| **This fork** | [maurovideosmr-wq/minecraft-dev-mcp-neoforge](https://github.com/maurovideosmr-wq/minecraft-dev-mcp-neoforge) — extends upstream with **NeoForge-first** workflows (mojmap defaults, AT validation, `decompile_neoforge_api` / index / search, docs via `modLoader: neoforge`). |
+| **Upstream** | [MCDxAI/minecraft-dev-mcp](https://github.com/MCDxAI/minecraft-dev-mcp) — pull updates: `git fetch upstream && git merge upstream/main` |
 
 ---
 
@@ -30,6 +37,7 @@
 | **Full-Text Search** | SQLite FTS5 indexes for fast searching across Minecraft and mod source with BM25 ranking |
 | **Mapping Translation** | Translate any symbol between official, intermediary, Yarn, and Mojmap namespaces |
 | **Unobfuscated Version Support** | Native support for Minecraft 26.1+ which ships with deobfuscated class names |
+| **NeoForge** | `decompile_neoforge_api` + FTS index/search on NeoForged JAR; `validate_access_transformer` for AT files; mod tools default to **mojmap** when `modLoader: neoforge` |
 | **WSL Compatibility** | Accepts both WSL (`/mnt/c/...`) and Windows (`C:\...`) paths throughout all tools |
 
 </div>
@@ -128,7 +136,7 @@ Add to `.claude/settings.local.json` in your project, or to your global Claude C
 
 ## Tools Reference
 
-20 tools organized by functionality.
+24 tools organized by functionality.
 
 ### Source Code (6 tools)
 
@@ -150,7 +158,7 @@ Translate names between namespaces and explore game data.
 | Tool | Description | Parameters |
 | --- | --- | --- |
 | **find_mapping** | Translate a class, method, or field name between any two mapping namespaces (official, intermediary, yarn, mojmap). | `symbol`, `version`, `sourceMapping`, `targetMapping` |
-| **remap_mod_jar** | Remap a Fabric mod JAR from intermediary to human-readable Yarn or Mojmap names. Accepts WSL and Windows paths. Minecraft version is auto-detected from mod metadata if not provided. | `inputJar`, `outputJar`, `toMapping` • Optional: `mcVersion` |
+| **remap_mod_jar** | Remap a **Fabric** mod JAR (intermediary → yarn/mojmap). **Not** for NeoForge MDK builds — pass `modLoader: neoforge` for an explicit error and guidance. | `inputJar`, `outputJar`, `toMapping` • Optional: `mcVersion`, `modLoader` |
 | **get_registry_data** | Extract registry data (blocks, items, entities, etc.) for a version by running Minecraft's built-in data generator. | `version` • Optional: `registry` (e.g., `block`, `item`, `entity`) |
 
 ### Analysis & Validation (6 tools)
@@ -161,10 +169,11 @@ Compare versions, validate mod code, and browse documentation.
 | --- | --- | --- |
 | **compare_versions** | Compare two Minecraft versions to identify added and removed classes and registry entries. | `fromVersion`, `toVersion`, `mapping` • Optional: `category` (`classes`\|`registry`\|`all`) |
 | **compare_versions_detailed** | AST-level version comparison showing exact method signature changes, field type changes, and breaking API modifications. Can be scoped to specific packages. | `fromVersion`, `toVersion`, `mapping` • Optional: `packages`, `maxClasses` |
-| **analyze_mixin** | Parse and validate Mixin code against Minecraft source. Validates target classes, injection methods, and annotation syntax. Provides similarity suggestions on failures. | `source` (Java code or file path), `mcVersion` • Optional: `mapping` |
-| **validate_access_widener** | Validate a Fabric Access Widener file against Minecraft source. Checks all class, method, and field targets exist and flags invalid entries. | `content` (file content or path), `mcVersion` • Optional: `mapping` |
-| **get_documentation** | Get documentation links and usage hints for a Minecraft or Fabric class. Links to Fabric Wiki and Minecraft Wiki. | `className` |
-| **search_documentation** | Search across all known Minecraft and Fabric documentation topics. | `query` |
+| **analyze_mixin** | Parse and validate Mixin code against Minecraft source. JARs: reads Fabric `fabric.mod.json` and Forge/Neo `mods.toml` / `neoforge.mods.toml` for mixin configs. | `source`, `mcVersion` • Optional: `mapping`, `modLoader` (`fabric` → yarn default, `neoforge` → mojmap) |
+| **validate_access_widener** | Validate a **Fabric** Access Widener file. For NeoForge, use `validate_access_transformer`; `modLoader: neoforge` returns a short pointer. | `content`, `mcVersion` • Optional: `mapping`, `modLoader` |
+| **validate_access_transformer** | Parse and validate **Forge/NeoForge** Access Transformer (`.cfg`) lines against decompiled mojmap (or yarn) sources. | `content`, `mcVersion` • Optional: `mapping` |
+| **get_documentation** | Class/concept docs: `modLoader: fabric` (Fabric Wiki) or `neoforge` (docs.neoforged.net). Never mix both in one call. | `className` • Optional: `modLoader`, `mcVersion` (NeoForged path hint) |
+| **search_documentation** | Search modding documentation for one stack only (`fabric` or `neoforge`). | `query` • Optional: `modLoader`, `mcVersion` |
 
 ### Mod Analysis (5 tools)
 
@@ -173,10 +182,13 @@ Analyze and decompile third-party mod JARs.
 | Tool | Description | Parameters |
 | --- | --- | --- |
 | **analyze_mod_jar** | Analyze a third-party mod JAR without decompiling. Extracts mod ID, version, dependencies, entry points, mixin configs, and class statistics. Supports Fabric, Quilt, Forge, and NeoForge. | `jarPath` • Optional: `includeAllClasses`, `includeRawMetadata` |
-| **decompile_mod_jar** | Decompile a mod JAR to readable Java source. Accepts original (intermediary) or remapped JARs. Mod ID and version are auto-detected from metadata. | `jarPath`, `mapping` • Optional: `modId`, `modVersion` |
-| **search_mod_code** | Regex search in decompiled mod source by class, method, field, or content. | `modId`, `modVersion`, `query`, `searchType`, `mapping` • Optional: `limit` |
-| **index_mod** | Build a SQLite FTS5 full-text search index for decompiled mod source. Required before using `search_mod_indexed`. | `modId`, `modVersion`, `mapping` • Optional: `force` |
-| **search_mod_indexed** | Fast FTS5 search on a pre-built mod index. Supports AND, OR, NOT, phrase matching, and prefix wildcards. | `query`, `modId`, `modVersion`, `mapping` • Optional: `types`, `limit` |
+| **decompile_mod_jar** | Decompile a mod JAR to readable source. **NeoForge:** default `mapping` is **mojmap** when `modLoader: neoforge`. | `jarPath` • Optional: `mapping`, `modLoader`, `modId`, `modVersion` |
+| **search_mod_code** | Regex search in decompiled mod source. | `modId`, `modVersion`, `query`, `searchType` • Optional: `mapping`, `modLoader`, `limit` |
+| **index_mod** | SQLite FTS5 index for decompiled mod source. | `modId`, `modVersion` • Optional: `mapping`, `modLoader`, `force` |
+| **search_mod_indexed** | FTS5 search on a mod index. | `query`, `modId`, `modVersion` • Optional: `mapping`, `modLoader`, `types`, `limit` |
+| **decompile_neoforge_api** | Download NeoForge **universal** JAR from NeoForged Maven and decompile to Java (API reference). | `mcVersion` • Optional: `neoForgeVersion`, `force` |
+| **index_neoforge_api** | Build FTS5 index for decompiled NeoForge API (requires decompile or existing tree). | `mcVersion` • Optional: `neoForgeVersion`, `force` |
+| **search_neoforge_api** | Search indexed NeoForge API sources. | `query`, `mcVersion` • Optional: `neoForgeVersion`, `types`, `limit` |
 
 </div>
 
@@ -194,6 +206,7 @@ Analyze and decompile third-party mod JARs.
 | **Find breaking changes between versions** | `compare_versions` for a high-level class and registry overview, then `compare_versions_detailed` scoped to specific packages for full AST-level method and field diffs. |
 | **Fast broad code search** | `index_minecraft_version` once per version/mapping combination, then `search_indexed` with FTS5 queries: `entity AND damage`, `"onBlockBreak"`, `tick*`, `BlockEntity NOT render`. |
 | **Translate obfuscated names** | `find_mapping` with `sourceMapping: "official"` and your obfuscated symbol to look up the equivalent Yarn or Mojmap name. Supports class, method, and field lookups. |
+| **NeoForge mod + API** | Use `modLoader: neoforge` and **mojmap** on mod tools. Vanilla: `decompile_minecraft_version` with `mojmap`. API: `decompile_neoforge_api` → `index_neoforge_api` → `search_neoforge_api`. AT files: `validate_access_transformer`. |
 
 </div>
 
@@ -217,7 +230,7 @@ Analyze and decompile third-party mod JARs.
 | **Schema Validation** | [Zod 3.24.1](https://github.com/colinhacks/zod) — runtime validation for all tool inputs |
 | **Language** | TypeScript 5.7.2, ESM-only (`"type": "module"`) |
 | **Linter** | Biome 1.9.4 |
-| **Tests** | Vitest 2.1.8 — 27 test files covering the full pipeline |
+| **Tests** | Vitest 2.1.8 — `npm test` (fast, offline-friendly) · `npm run test:integration` (full downloads) |
 
 ### Remapping Strategy
 
@@ -247,7 +260,9 @@ Intermediary provides stable, version-independent identifiers that bridge betwee
 | `decompiled-mods/{modId}/{modVersion}/{mapping}/` | Decompiled mod source files |
 | `registry/{version}/` | Registry data extracted by Minecraft's data generator |
 | `resources/` | VineFlower and tiny-remapper JARs (downloaded once) |
-| `search_index.db` | SQLite FTS5 indexes for Minecraft and mod source |
+| `search_index.db` | SQLite FTS5 indexes for Minecraft, mod, and NeoForge API source |
+| `decompiled-neoforge/{mc}/{neoVersion}/` | Decompiled NeoForge universal API (VineFlower) |
+| `neoforge/jars/` | Cached NeoForge universal JARs |
 | `minecraft-dev-mcp.db` | Metadata, job tracking, and cache state |
 | `minecraft-dev-mcp.log` | Server log file |
 
@@ -286,6 +301,7 @@ Yarn mappings are discontinued after 1.21.11, which is the last obfuscated Minec
 | --- | --- |
 | `CACHE_DIR` | Override the default cache directory location |
 | `LOG_LEVEL` | Logging verbosity: `DEBUG`, `INFO`, `WARN`, `ERROR` |
+| `NEOFORGE_DOCS_VERSION` | Force NeoForged docs path segment (e.g. `1.21.1`) for `get_documentation` / `search_documentation` when `modLoader: neoforge` |
 
 </div>
 
@@ -329,11 +345,14 @@ Yarn mappings are discontinued after 1.21.11, which is the last obfuscated Minec
 **Build from source:**
 
 ```bash
-git clone https://github.com/MCDxAI/minecraft-dev-mcp.git
-cd minecraft-dev-mcp
+# This fork (NeoForge-oriented additions)
+git clone https://github.com/maurovideosmr-wq/minecraft-dev-mcp-neoforge.git
+cd minecraft-dev-mcp-neoforge
 npm install
 npm run build
 ```
+
+Upstream clone (for comparison): `https://github.com/MCDxAI/minecraft-dev-mcp.git` — add as `git remote add upstream <url>` to merge updates.
 
 ---
 
