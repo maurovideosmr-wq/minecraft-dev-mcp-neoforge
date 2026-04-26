@@ -1,6 +1,7 @@
-import { describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import { handleAnalyzeMixin } from '../../src/server/tools.js';
-import { getMixinService } from '../../src/services/mixin-service.js';
+import { getMixinService, MixinService } from '../../src/services/mixin-service.js';
+import type { MixinClass, MixinValidationResult } from '../../src/types/minecraft.js';
 import { TEST_MAPPING, TEST_VERSION } from '../test-constants.js';
 
 /**
@@ -13,6 +14,10 @@ import { TEST_MAPPING, TEST_VERSION } from '../test-constants.js';
  */
 
 describe('Mixin Service', () => {
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
   it('should parse a simple mixin source', () => {
     const mixinService = getMixinService();
 
@@ -125,20 +130,37 @@ public class TestMixin {
 }
 `;
 
+    const dummyMixin: MixinClass = {
+      className: 'com.example.mixin.TestMixin',
+      targets: ['Entity'],
+      priority: 1000,
+      injections: [],
+      shadows: [],
+      accessors: [],
+    };
+    const mockResult: MixinValidationResult = {
+      mixin: dummyMixin,
+      isValid: true,
+      errors: [],
+      warnings: [],
+      suggestions: [],
+    };
+    const validateSpy = vi
+      .spyOn(MixinService.prototype, 'validateMixin')
+      .mockResolvedValue(mockResult);
+
     const result = await handleAnalyzeMixin({
       source,
       mcVersion: TEST_VERSION,
       mapping: TEST_MAPPING,
     });
 
-    expect(result).toBeDefined();
-    expect(result.content).toBeDefined();
-    expect(result.content.length).toBe(1);
-
-    // Should return validation result (may have errors if Entity not found by simple name)
-    const text = result.content[0].text;
+    expect(validateSpy).toHaveBeenCalledTimes(1);
+    expect(result.content?.length).toBe(1);
+    const text = result.content?.[0]?.text;
     expect(text).toBeDefined();
-  }, 30000);
+    expect(text).toContain('"isValid": true');
+  });
 
   it('should handle invalid mixin source gracefully', async () => {
     const result = await handleAnalyzeMixin({

@@ -317,7 +317,8 @@ Yarn mappings are discontinued after 1.21.11, which is the last obfuscated Minec
 | **Type check** | `npm run typecheck` |
 | **Lint** | `npm run lint` |
 | **Lint with autofix** | `npm run lint:fix` |
-| **Integration tests** | `npm test` |
+| **Default tests (fast, offline-friendly)** | `npm test` |
+| **Full integration tests (downloads JARs/mappings)** | `npm run test:integration` |
 | **Full pipeline — 1.21.10** | `npm run test:manual:1.21.10` |
 | **Full pipeline — 1.20.1** | `npm run test:manual:1.20.1` |
 | **MCP stdio tests** | `npm run test:manual:mcp` |

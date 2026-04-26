@@ -1,8 +1,14 @@
-import { describe, expect, it } from 'vitest';
+import { existsSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
+import { join } from 'node:path';
+import { afterEach, describe, expect, it } from 'vitest';
 import { getCacheManager } from '../../src/cache/cache-manager.js';
 import { handleIndexVersion, handleSearchIndexed } from '../../src/server/tools.js';
 import { getSearchIndexService } from '../../src/services/search-index-service.js';
+import { getDecompiledNeoforgePath } from '../../src/utils/paths.js';
 import { TEST_MAPPING, TEST_VERSION } from '../test-constants.js';
+
+const NEO_FTS_TEST_MC = '0.0.0-mcp-neoforge-fts';
+const NEO_FTS_TEST_NEO = '0.0.0-mcp-neoforge-fts-bogusver';
 
 /**
  * Search Index Service Tests
@@ -116,5 +122,59 @@ describe('Search Index Service', () => {
 
     expect(result).toBeDefined();
     expect(result.isError).toBe(true);
+  });
+});
+
+describe('Search Index Service — NeoForge API', () => {
+  const neoDecompiledDir = getDecompiledNeoforgePath(NEO_FTS_TEST_MC, NEO_FTS_TEST_NEO);
+
+  afterEach(() => {
+    const searchService = getSearchIndexService();
+    try {
+      if (searchService.isNeoforgeApiIndexed(NEO_FTS_TEST_MC, NEO_FTS_TEST_NEO)) {
+        searchService.clearNeoforgeApiIndex(NEO_FTS_TEST_MC, NEO_FTS_TEST_NEO);
+      }
+    } catch {
+      /* ignore */
+    }
+    if (existsSync(neoDecompiledDir)) {
+      rmSync(neoDecompiledDir, { recursive: true, force: true });
+    }
+  });
+
+  it('should index and search NeoForge API sources from a fake decompile tree', async () => {
+    mkdirSync(join(neoDecompiledDir, 'com', 'mcp', 'neotest'), { recursive: true });
+    writeFileSync(
+      join(neoDecompiledDir, 'com', 'mcp', 'neotest', 'NeoForgeFixture.java'),
+      `package com.mcp.neotest;
+public class NeoForgeFixture {
+  public void uniqueNeoForgeSearchToken() { }
+}
+`,
+    );
+
+    const searchService = getSearchIndexService();
+    const { fileCount } = await searchService.indexNeoforgeApi(NEO_FTS_TEST_MC, NEO_FTS_TEST_NEO);
+    expect(fileCount).toBe(1);
+    expect(searchService.isNeoforgeApiIndexed(NEO_FTS_TEST_MC, NEO_FTS_TEST_NEO)).toBe(true);
+
+    const results = searchService.searchNeoforgeApi('uniqueNeoForgeSearchToken', NEO_FTS_TEST_MC, NEO_FTS_TEST_NEO, {
+      limit: 20,
+    });
+    expect(results.length).toBeGreaterThan(0);
+    expect(
+      results.some(
+        (r) =>
+          r.symbol === 'uniqueNeoForgeSearchToken' ||
+          r.className === 'com.mcp.neotest.NeoForgeFixture',
+      ),
+    ).toBe(true);
+  }, 30000);
+
+  it('indexNeoforgeApi should throw when decompiled directory is missing', async () => {
+    const searchService = getSearchIndexService();
+    await expect(
+      searchService.indexNeoforgeApi('99.99.99-no-such-mc', '99.99.99-nope'),
+    ).rejects.toThrow(/decompile_neoforge_api|not found/i);
   });
 });

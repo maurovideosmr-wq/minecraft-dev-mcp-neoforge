@@ -24,6 +24,8 @@ export class CacheManager {
     ensureDir(paths.remapped());
     ensureDir(paths.decompiled());
     ensureDir(paths.decompiledMods());
+    ensureDir(paths.decompiledNeoforge());
+    ensureDir(paths.neoforgeJars());
     ensureDir(paths.registry());
     ensureDir(paths.resources());
   }

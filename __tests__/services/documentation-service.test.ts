@@ -51,10 +51,18 @@ describe('Documentation Service', () => {
     expect(doc?.url).toContain('mixin');
   });
 
-  it('should search documentation', () => {
+  it('should search documentation (fabric)', () => {
     const docService = getDocumentationService();
 
-    const results = docService.searchDocumentation('entity');
+    const results = docService.searchDocumentation('entity', 'fabric');
+
+    expect(results.length).toBeGreaterThan(0);
+  });
+
+  it('should search documentation (neoforge)', () => {
+    const docService = getDocumentationService();
+
+    const results = docService.searchDocumentation('entity', 'neoforge');
 
     expect(results.length).toBeGreaterThan(0);
   });
@@ -90,9 +98,10 @@ describe('Documentation Service', () => {
     expect(result.content).toBeDefined();
     expect(result.content.length).toBe(1);
 
-    const docs = JSON.parse(result.content[0].text);
-    expect(Array.isArray(docs)).toBe(true);
-    expect(docs.length).toBeGreaterThan(0);
+    const payload = JSON.parse(result.content[0].text);
+    expect(payload.modLoader).toBe('fabric');
+    expect(Array.isArray(payload.results)).toBe(true);
+    expect(payload.results.length).toBeGreaterThan(0);
   });
 
   it('should handle search_documentation tool', async () => {
@@ -105,6 +114,7 @@ describe('Documentation Service', () => {
 
     const data = JSON.parse(result.content[0].text);
     expect(data.query).toBe('block');
+    expect(data.modLoader).toBe('fabric');
     expect(data.results).toBeDefined();
     expect(data.results.length).toBeGreaterThan(0);
   });

@@ -21,7 +21,7 @@ describe('MCP Resources', () => {
   it('should have resource templates defined', () => {
     expect(resourceTemplates).toBeDefined();
     expect(Array.isArray(resourceTemplates)).toBe(true);
-    expect(resourceTemplates.length).toBe(8);
+    expect(resourceTemplates.length).toBe(10);
 
     const templateUris = resourceTemplates.map((t) => t.uriTemplate);
 
@@ -33,7 +33,9 @@ describe('MCP Resources', () => {
 
     // Documentation and index templates
     expect(templateUris).toContain('minecraft://docs/{className}');
+    expect(templateUris).toContain('minecraft://docs/{modLoader}/{className}');
     expect(templateUris).toContain('minecraft://docs/topic/{topic}');
+    expect(templateUris).toContain('minecraft://docs/topic/{modLoader}/{topic}');
     expect(templateUris).toContain('minecraft://index/{version}/{mapping}');
     expect(templateUris).toContain('minecraft://index/list');
   });
@@ -80,7 +82,7 @@ describe('MCP Resources', () => {
 
     const data = JSON.parse(result.contents[0].text ?? '{}');
     expect(data).toBeDefined();
-  }, 300000);
+  }, 600000);
 });
 
 describe('Documentation and Index Resources', () => {
@@ -88,13 +90,15 @@ describe('Documentation and Index Resources', () => {
     const { resourceTemplates } = await import('../../src/server/resources.js');
 
     expect(resourceTemplates).toBeDefined();
-    expect(resourceTemplates.length).toBe(8);
+    expect(resourceTemplates.length).toBe(10);
 
     const templateUris = resourceTemplates.map((t) => t.uriTemplate);
 
     // Documentation templates
     expect(templateUris).toContain('minecraft://docs/{className}');
+    expect(templateUris).toContain('minecraft://docs/{modLoader}/{className}');
     expect(templateUris).toContain('minecraft://docs/topic/{topic}');
+    expect(templateUris).toContain('minecraft://docs/topic/{modLoader}/{topic}');
 
     // Index templates
     expect(templateUris).toContain('minecraft://index/{version}/{mapping}');
@@ -105,12 +109,14 @@ describe('Documentation and Index Resources', () => {
     const { resources } = await import('../../src/server/resources.js');
 
     expect(resources).toBeDefined();
-    expect(resources.length).toBe(4);
+    expect(resources.length).toBe(6);
 
     const uris = resources.map((r) => r.uri);
     expect(uris).toContain('minecraft://index/list');
     expect(uris).toContain('minecraft://docs/topic/mixin');
     expect(uris).toContain('minecraft://docs/topic/accesswidener');
+    expect(uris).toContain('minecraft://docs/topic/neoforge/mixin');
+    expect(uris).toContain('minecraft://docs/topic/neoforge/access');
   });
 
   it('should read documentation resource', async () => {

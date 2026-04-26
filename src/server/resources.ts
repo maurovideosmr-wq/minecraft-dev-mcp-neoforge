@@ -1,6 +1,10 @@
 import { existsSync, readFileSync } from 'node:fs';
 import { getDecompileService } from '../services/decompile-service.js';
-import { getDocumentationService } from '../services/documentation-service.js';
+import {
+  getDocumentationService,
+  getNeoforgedDocsVersion,
+  type ModDocLoader,
+} from '../services/documentation-service.js';
 import { getMappingService } from '../services/mapping-service.js';
 import { getRegistryService } from '../services/registry-service.js';
 import { getSearchIndexService } from '../services/search-index-service.js';
@@ -43,14 +47,29 @@ export const resourceTemplates = [
   // Phase 2 resources
   {
     uriTemplate: 'minecraft://docs/{className}',
-    name: 'Class Documentation',
-    description: 'Documentation for a Minecraft class (Fabric Wiki links, summaries)',
+    name: 'Class Documentation (Fabric default)',
+    description:
+      'Class docs (Fabric Wiki by default). Use minecraft://docs/neoforge/{className} or fabric/{className} for one stack only.',
+    mimeType: 'application/json',
+  },
+  {
+    uriTemplate: 'minecraft://docs/{modLoader}/{className}',
+    name: 'Class Documentation (by mod loader)',
+    description:
+      'Class docs: modLoader = fabric (Fabric Wiki) or neoforge (docs.neoforged.net, version from NEOFORGE_DOCS_VERSION).',
     mimeType: 'application/json',
   },
   {
     uriTemplate: 'minecraft://docs/topic/{topic}',
     name: 'Topic Documentation',
-    description: 'Documentation for a Minecraft modding topic (mixin, blocks, entities, etc.)',
+    description:
+      'Topic docs (default Fabric for mixin/accesswidener). For NeoForge: minecraft://docs/topic/neoforge/mixin or .../neoforge/access.',
+    mimeType: 'application/json',
+  },
+  {
+    uriTemplate: 'minecraft://docs/topic/{modLoader}/{topic}',
+    name: 'Topic Documentation (by mod loader)',
+    description: 'mixin and access: use fabric/ or neoforge/ to pick Fabric Wiki vs NeoForged pointers.',
     mimeType: 'application/json',
   },
   {
@@ -85,14 +104,26 @@ export const resources = [
   },
   {
     uri: 'minecraft://docs/topic/mixin',
-    name: 'Mixin Documentation',
-    description: 'Documentation and guide for using Mixins in Fabric mods',
+    name: 'Mixin Documentation (Fabric)',
+    description: 'Fabric Wiki – Mixins. For NeoForge, use minecraft://docs/topic/neoforge/mixin',
+    mimeType: 'application/json',
+  },
+  {
+    uri: 'minecraft://docs/topic/neoforge/mixin',
+    name: 'Mixin Documentation (NeoForge)',
+    description: 'NeoForged doc pointer for Mixin in NeoForge mods',
     mimeType: 'application/json',
   },
   {
     uri: 'minecraft://docs/topic/accesswidener',
-    name: 'Access Widener Documentation',
-    description: 'Documentation and guide for Access Wideners in Fabric mods',
+    name: 'Access Widener Documentation (Fabric)',
+    description: 'Fabric Access Widener v2. NeoForge uses ATs: minecraft://docs/topic/neoforge/access',
+    mimeType: 'application/json',
+  },
+  {
+    uri: 'minecraft://docs/topic/neoforge/access',
+    name: 'Access Transformers (NeoForge)',
+    description: 'NeoForged pointer (not Fabric Access Widener)',
     mimeType: 'application/json',
   },
 ];
@@ -115,6 +146,9 @@ function parseMinecraftUri(uri: string): {
   className?: string;
   registryType?: string;
   topic?: string;
+  modLoader?: ModDocLoader;
+  /** fabric | neoforge for docs/topic/{loader}/… */
+  topicLoader?: ModDocLoader;
 } | null {
   const match = uri.match(/^minecraft:\/\/(.+)$/);
   if (!match) return null;
@@ -171,6 +205,16 @@ function parseMinecraftUri(uri: string): {
     };
   }
 
+  // minecraft://docs/topic/{fabric|neoforge}/{topic} — before generic topic
+  const docsTopicLoaderMatch = path.match(/^docs\/topic\/(fabric|neoforge)\/(.+)$/);
+  if (docsTopicLoaderMatch) {
+    return {
+      type: 'docs-topic',
+      topicLoader: docsTopicLoaderMatch[1] as ModDocLoader,
+      topic: docsTopicLoaderMatch[2],
+    };
+  }
+
   // minecraft://docs/topic/{topic}
   const docsTopicMatch = path.match(/^docs\/topic\/(.+)$/);
   if (docsTopicMatch) {
@@ -180,7 +224,17 @@ function parseMinecraftUri(uri: string): {
     };
   }
 
-  // minecraft://docs/{className}
+  // minecraft://docs/{fabric|neoforge}/{className}
+  const docsLoaderMatch = path.match(/^docs\/(fabric|neoforge)\/(.+)$/);
+  if (docsLoaderMatch) {
+    return {
+      type: 'docs',
+      modLoader: docsLoaderMatch[1] as ModDocLoader,
+      className: docsLoaderMatch[2],
+    };
+  }
+
+  // minecraft://docs/{className} (default Fabric Wiki; legacy)
   const docsMatch = path.match(/^docs\/(.+)$/);
   if (docsMatch) {
     return {
@@ -231,9 +285,17 @@ export async function handleReadResource(uri: string): Promise<{
       return handleRegistryResource(uri, parsed.version ?? '', parsed.registryType);
     // Phase 2 resources
     case 'docs':
-      return handleDocsResource(uri, parsed.className ?? '');
+      return handleDocsResource(
+        uri,
+        parsed.className ?? '',
+        parsed.modLoader ?? 'fabric',
+      );
     case 'docs-topic':
-      return handleDocsTopicResource(uri, parsed.topic ?? '');
+      return handleDocsTopicResource(
+        uri,
+        parsed.topic ?? '',
+        parsed.topicLoader,
+      );
     case 'index':
       return handleIndexResource(uri, parsed.version ?? '', parsed.mapping ?? 'yarn');
     case 'index-list':
@@ -358,17 +420,37 @@ async function handleRegistryResource(uri: string, version: string, registryType
 // ============================================================================
 
 /**
- * Handle minecraft://docs/{className} resource
+ * Handle minecraft://docs/({fabric|neoforge}/){className} — legacy `docs/{className}` = fabric
  */
-async function handleDocsResource(uri: string, className: string) {
+async function handleDocsResource(uri: string, className: string, modLoader: ModDocLoader) {
   const docService = getDocumentationService();
 
-  const doc = await docService.getDocumentation(className);
-  const related = await docService.getRelatedDocumentation(className);
+  if (modLoader === 'fabric') {
+    const doc = await docService.getDocumentation(className);
+    const related = await docService.getRelatedDocumentation(className, 'fabric');
+    const data = {
+      className,
+      modLoader: 'fabric' as const,
+      documentation: doc,
+      relatedDocumentation: related,
+    };
+    return {
+      contents: [
+        {
+          uri,
+          mimeType: 'application/json',
+          text: JSON.stringify(data, null, 2),
+        },
+      ],
+    };
+  }
 
+  const related = await docService.getRelatedDocumentation(className, 'neoforge');
   const data = {
     className,
-    documentation: doc,
+    modLoader: 'neoforge' as const,
+    neoforgedDocsVersion: getNeoforgedDocsVersion(),
+    documentation: related[0] ?? null,
     relatedDocumentation: related,
   };
 
@@ -384,13 +466,34 @@ async function handleDocsResource(uri: string, className: string) {
 }
 
 /**
- * Handle minecraft://docs/topic/{topic} resource
+ * Handle minecraft://docs/topic/({fabric|neoforge}/){topic} resource
  */
-async function handleDocsTopicResource(uri: string, topic: string) {
+async function handleDocsTopicResource(
+  uri: string,
+  topic: string,
+  topicLoader: ModDocLoader | undefined,
+) {
   const docService = getDocumentationService();
 
-  // Handle special topics
-  if (topic === 'mixin') {
+  const loader: ModDocLoader = topicLoader ?? 'fabric';
+
+  if (loader === 'neoforge' && (topic === 'mixin' || topic === 'access' || topic === 'access_at')) {
+    const data =
+      topic === 'mixin'
+        ? docService.getNeoforgedMixinDocumentation()
+        : docService.getNeoforgedAccessTransformerPointer();
+    return {
+      contents: [
+        {
+          uri,
+          mimeType: 'application/json',
+          text: JSON.stringify(data, null, 2),
+        },
+      ],
+    };
+  }
+
+  if (loader === 'fabric' && topic === 'mixin') {
     const data = docService.getMixinDocumentation();
     return {
       contents: [
@@ -403,7 +506,7 @@ async function handleDocsTopicResource(uri: string, topic: string) {
     };
   }
 
-  if (topic === 'accesswidener') {
+  if (loader === 'fabric' && topic === 'access') {
     const data = docService.getAccessWidenerDocumentation();
     return {
       contents: [
@@ -416,7 +519,32 @@ async function handleDocsTopicResource(uri: string, topic: string) {
     };
   }
 
-  // Generic topic lookup
+  if (topic === 'accesswidener' || topic === 'access_widener') {
+    const data = docService.getAccessWidenerDocumentation();
+    return {
+      contents: [
+        {
+          uri,
+          mimeType: 'application/json',
+          text: JSON.stringify(data, null, 2),
+        },
+      ],
+    };
+  }
+
+  if (loader === 'neoforge') {
+    const doc = await docService.getNeoforgedTopicDocumentation(topic);
+    return {
+      contents: [
+        {
+          uri,
+          mimeType: 'application/json',
+          text: JSON.stringify(doc, null, 2),
+        },
+      ],
+    };
+  }
+
   const doc = await docService.getTopicDocumentation(topic);
 
   return {

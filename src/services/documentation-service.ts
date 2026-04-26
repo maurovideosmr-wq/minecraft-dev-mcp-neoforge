@@ -3,6 +3,7 @@
  *
  * Provides documentation from multiple sources for Minecraft classes and methods:
  * - Fabric Wiki
+ * - NeoForged (docs for MC 1.21.1 — parallel to Fabric, additive)
  * - Minecraft Wiki (for game concepts)
  * - Parchment parameter names and javadocs
  */
@@ -12,6 +13,57 @@ import { join } from 'node:path';
 import type { DocumentationEntry } from '../types/minecraft.js';
 import { logger } from '../utils/logger.js';
 import { getCacheDir } from '../utils/paths.js';
+
+/** Which modding stack docs to return — never both in one response. */
+export type ModDocLoader = 'fabric' | 'neoforge';
+
+/**
+ * NeoForged docs path segment for docs.neoforged.net/docs/{version}/…
+ * Priority: `NEOFORGE_DOCS_VERSION` env → Minecraft version mapping → default 1.21.1.
+ */
+export function resolveNeoforgedDocsVersion(mcVersion?: string): string {
+  const env = process.env.NEOFORGE_DOCS_VERSION?.trim();
+  if (env) {
+    return env;
+  }
+  const v = mcVersion?.trim();
+  if (v) {
+    /**
+     * Maps Minecraft versions to the docs path segment on docs.neoforged.net (e.g. `1.21.4` →
+     * `https://docs.neoforged.net/docs/1.21.4/...`). When NeoForged publishes a new docs tree for
+     * an MC release, add the pair here. Alternatively set `NEOFORGE_DOCS_VERSION` in the
+     * environment to force a version without code changes.
+     */
+    const MC_TO_DOCS: Record<string, string> = {
+      '1.21.1': '1.21.1',
+      '1.21.4': '1.21.4',
+      '1.21.5': '1.21.5',
+      '1.20.1': '1.20.1',
+      '1.20.4': '1.20.4',
+      '1.21': '1.21.1',
+      '1.20': '1.20.1',
+    };
+    if (MC_TO_DOCS[v]) {
+      return MC_TO_DOCS[v];
+    }
+    const triplet = v.match(/^(\d+\.\d+\.\d+)/);
+    if (triplet?.[1] && MC_TO_DOCS[triplet[1]]) {
+      return MC_TO_DOCS[triplet[1]];
+    }
+    return triplet?.[1] ?? v;
+  }
+  return '1.21.1';
+}
+
+/** Same as {@link resolveNeoforgedDocsVersion}() without an MC version hint. */
+export function getNeoforgedDocsVersion(): string {
+  return resolveNeoforgedDocsVersion();
+}
+
+export function buildNeoforgedDocsUrl(docsVersion: string, relPath: string): string {
+  const p = relPath.startsWith('/') ? relPath : `/${relPath}`;
+  return `https://docs.neoforged.net/docs/${docsVersion}${p}`;
+}
 
 /**
  * Documentation cache entry
@@ -131,6 +183,51 @@ const FABRIC_WIKI_PAGES: Record<string, string> = {
 };
 
 /**
+ * Same topic keys as {@link FABRIC_WIKI_PAGES} where possible — paths only; pair with {@link buildNeoforgedDocsUrl}.
+ */
+const NEOFORGED_WIKI_REL: Record<string, string> = {
+  entity: '/concepts/registries',
+  block: '/blocks/',
+  item: '/items/',
+  world: '/resources/',
+  recipe: '/resources/server/recipes/',
+  mixin: '/gettingstarted/',
+  accesswidener: '/gettingstarted/',
+  registry: '/concepts/registries',
+  networking: '/networking/',
+  commands: '/resources/',
+  events: '/concepts/events',
+  rendering: '/resources/client/models/',
+  blockentity: '/blockentities/',
+  screenhandler: '/items/',
+  datagen: '/resources/',
+};
+
+/** NeoForged path for each {@link KNOWN_DOCS} class (same class names as obfuscated/official code). */
+const NEOFORGED_KNOWN_DOCS_REL: Record<string, string> = {
+  'net.minecraft.entity.Entity': '/concepts/registries',
+  'net.minecraft.entity.LivingEntity': '/concepts/registries',
+  'net.minecraft.entity.player.PlayerEntity': '/concepts/registries',
+  'net.minecraft.block.Block': '/blocks/',
+  'net.minecraft.block.BlockState': '/blocks/states',
+  'net.minecraft.item.Item': '/items/',
+  'net.minecraft.item.ItemStack': '/items/',
+  'net.minecraft.world.World': '/resources/',
+  'net.minecraft.server.world.ServerWorld': '/resources/',
+  'net.minecraft.client.world.ClientWorld': '/resources/',
+  'net.minecraft.nbt.NbtCompound': '/datastorage/nbt',
+  'net.minecraft.util.Identifier': '/misc/resourcelocation',
+  'net.minecraft.util.math.BlockPos': '/blocks/',
+  'net.minecraft.util.math.Vec3d': '/blocks/',
+  'net.minecraft.text.Text': '/resources/',
+  'net.minecraft.screen.ScreenHandler': '/items/',
+  'net.minecraft.recipe.Recipe': '/resources/server/recipes/',
+  'net.minecraft.registry.Registry': '/concepts/registries',
+  'net.minecraft.sound.SoundEvent': '/resources/',
+  'net.minecraft.particle.ParticleEffect': '/resources/',
+};
+
+/**
  * Documentation Integration Service
  */
 export class DocumentationService {
@@ -172,6 +269,135 @@ export class DocumentationService {
     } catch (error) {
       logger.warn('Failed to save documentation cache:', error);
     }
+  }
+
+  private static docKey(d: DocumentationEntry): string {
+    return `${d.source}::${d.url}`;
+  }
+
+  private pushIfNew(list: DocumentationEntry[], item: DocumentationEntry): boolean {
+    if (list.some((x) => DocumentationService.docKey(x) === DocumentationService.docKey(item))) {
+      return false;
+    }
+    list.push(item);
+    return true;
+  }
+
+  /**
+   * NeoForged doc link for a class (use with modLoader === 'neoforge' only).
+   */
+  getNeoforgedDocumentationForClass(className: string, mcVersion?: string): DocumentationEntry | null {
+    const dv = resolveNeoforgedDocsVersion(mcVersion);
+    const rel = NEOFORGED_KNOWN_DOCS_REL[className];
+    if (rel) {
+      return {
+        name: className,
+        source: 'neoforged_docs',
+        url: buildNeoforgedDocsUrl(dv, rel),
+        summary: KNOWN_DOCS[className]?.summary || `NeoForged ${dv} reference`,
+      };
+    }
+    return this.inferNeoforgedDocumentation(className, dv);
+  }
+
+  /**
+   * NeoForged topic page (mirrors {@link getTopicDocumentation} keys).
+   */
+  getNeoforgedTopicDocumentation(topic: string, mcVersion?: string): DocumentationEntry | null {
+    const dv = resolveNeoforgedDocsVersion(mcVersion);
+    const topicLower = topic.toLowerCase();
+    const rel = NEOFORGED_WIKI_REL[topicLower];
+    if (rel) {
+      return {
+        name: `neoforged/${topicLower}`,
+        source: 'neoforged_docs',
+        url: buildNeoforgedDocsUrl(dv, rel),
+        summary: `NeoForged ${dv} — ${topic} topic`,
+      };
+    }
+    for (const [key, path] of Object.entries(NEOFORGED_WIKI_REL)) {
+      if (key.includes(topicLower) || topicLower.includes(key)) {
+        return {
+          name: `neoforged/${key}`,
+          source: 'neoforged_docs',
+          url: buildNeoforgedDocsUrl(dv, path),
+          summary: `NeoForged ${dv} — ${key} topic`,
+        };
+      }
+    }
+    return null;
+  }
+
+  private inferNeoforgedDocumentation(className: string, dv: string): DocumentationEntry | null {
+    const simpleName = className.split('.').pop() || className;
+    const toNf = (k: keyof typeof NEOFORGED_WIKI_REL) =>
+      this.topicEntryNeoforged(k, className, simpleName, dv);
+
+    if (className.includes('.entity.') || simpleName.endsWith('Entity')) {
+      return toNf('entity');
+    }
+    if (className.includes('.block.') || simpleName.endsWith('Block')) {
+      return toNf('block');
+    }
+    if (className.includes('.item.') || simpleName.endsWith('Item')) {
+      return toNf('item');
+    }
+    if (
+      className.includes('.screen.') ||
+      simpleName.endsWith('Screen') ||
+      simpleName.endsWith('Handler')
+    ) {
+      return toNf('screenhandler');
+    }
+    if (className.includes('.recipe.') || simpleName.endsWith('Recipe')) {
+      return toNf('recipe');
+    }
+    if (
+      className.includes('.network.') ||
+      simpleName.endsWith('Packet') ||
+      simpleName.endsWith('S2CPacket') ||
+      simpleName.endsWith('C2SPacket')
+    ) {
+      return toNf('networking');
+    }
+    if (className.includes('.command.') || simpleName.endsWith('Command')) {
+      return toNf('commands');
+    }
+    if (
+      className.includes('.render.') ||
+      simpleName.endsWith('Renderer') ||
+      simpleName.endsWith('Model')
+    ) {
+      return toNf('rendering');
+    }
+    if (className.includes('.registry.') || simpleName.includes('Registry')) {
+      return toNf('registry');
+    }
+    if (simpleName.endsWith('BlockEntity')) {
+      return toNf('blockentity');
+    }
+
+    return null;
+  }
+
+  private topicEntryNeoforged(
+    topic: keyof typeof NEOFORGED_WIKI_REL,
+    className: string,
+    simpleName: string,
+    dv: string,
+  ): DocumentationEntry {
+    const category =
+      topic === 'blockentity'
+        ? 'block entity'
+        : topic === 'screenhandler'
+          ? 'screen/GUI'
+          : String(topic);
+    return {
+      name: className,
+      source: 'neoforged_docs',
+      url: buildNeoforgedDocsUrl(dv, NEOFORGED_WIKI_REL[topic]),
+      summary: `${this.generateSummary(simpleName, category)} (NeoForged ${dv})`,
+    };
   }
 
   /**
@@ -379,45 +605,97 @@ export class DocumentationService {
   }
 
   /**
-   * Get all documentation URLs for a class and its context
+   * Related docs for one class, **single loader only** (fabric or neoforge — not both).
    */
-  async getRelatedDocumentation(className: string): Promise<DocumentationEntry[]> {
+  async getRelatedDocumentation(
+    className: string,
+    modLoader: ModDocLoader = 'fabric',
+    mcVersion?: string,
+  ): Promise<DocumentationEntry[]> {
+    if (modLoader === 'neoforge') {
+      return this.getRelatedDocumentationNeoforge(className, mcVersion);
+    }
+    return this.getRelatedDocumentationFabric(className);
+  }
+
+  private async getRelatedDocumentationFabric(className: string): Promise<DocumentationEntry[]> {
     const results: DocumentationEntry[] = [];
 
-    // Get main documentation
     const main = await this.getDocumentation(className);
     if (main) {
-      results.push(main);
+      this.pushIfNew(results, main);
     }
 
-    // Get documentation for related classes
     if (main?.seeAlso) {
       for (const related of main.seeAlso) {
         const relatedDoc = await this.getDocumentation(related);
-        if (relatedDoc && !results.some((r) => r.name === relatedDoc.name)) {
-          results.push(relatedDoc);
+        if (relatedDoc) {
+          this.pushIfNew(results, relatedDoc);
         }
       }
     }
 
-    // Infer related topics from package
     const packagePath = className.split('.').slice(0, -1).join('.');
     if (packagePath.includes('entity')) {
       const entityDoc = await this.getTopicDocumentation('entity');
-      if (entityDoc && !results.some((r) => r.url === entityDoc.url)) {
-        results.push(entityDoc);
+      if (entityDoc) {
+        this.pushIfNew(results, entityDoc);
       }
     }
     if (packagePath.includes('block')) {
       const blockDoc = await this.getTopicDocumentation('block');
-      if (blockDoc && !results.some((r) => r.url === blockDoc.url)) {
-        results.push(blockDoc);
+      if (blockDoc) {
+        this.pushIfNew(results, blockDoc);
       }
     }
     if (packagePath.includes('item')) {
       const itemDoc = await this.getTopicDocumentation('item');
-      if (itemDoc && !results.some((r) => r.url === itemDoc.url)) {
-        results.push(itemDoc);
+      if (itemDoc) {
+        this.pushIfNew(results, itemDoc);
+      }
+    }
+
+    return results;
+  }
+
+  private async getRelatedDocumentationNeoforge(
+    className: string,
+    mcVersion?: string,
+  ): Promise<DocumentationEntry[]> {
+    const results: DocumentationEntry[] = [];
+
+    const neoMain = this.getNeoforgedDocumentationForClass(className, mcVersion);
+    if (neoMain) {
+      this.pushIfNew(results, neoMain);
+    }
+
+    const fabricForSeeAlso = await this.getDocumentation(className);
+    if (fabricForSeeAlso?.seeAlso) {
+      for (const related of fabricForSeeAlso.seeAlso) {
+        const relatedNeo = this.getNeoforgedDocumentationForClass(related, mcVersion);
+        if (relatedNeo) {
+          this.pushIfNew(results, relatedNeo);
+        }
+      }
+    }
+
+    const packagePath = className.split('.').slice(0, -1).join('.');
+    if (packagePath.includes('entity')) {
+      const ne = this.getNeoforgedTopicDocumentation('entity', mcVersion);
+      if (ne) {
+        this.pushIfNew(results, ne);
+      }
+    }
+    if (packagePath.includes('block')) {
+      const ne = this.getNeoforgedTopicDocumentation('block', mcVersion);
+      if (ne) {
+        this.pushIfNew(results, ne);
+      }
+    }
+    if (packagePath.includes('item')) {
+      const ne = this.getNeoforgedTopicDocumentation('item', mcVersion);
+      if (ne) {
+        this.pushIfNew(results, ne);
       }
     }
 
@@ -425,13 +703,23 @@ export class DocumentationService {
   }
 
   /**
-   * Search for documentation across all known entries
+   * Search documentation for **one** mod stack (fabric or neoforge), never both.
    */
-  searchDocumentation(query: string): DocumentationEntry[] {
+  searchDocumentation(
+    query: string,
+    modLoader: ModDocLoader = 'fabric',
+    mcVersion?: string,
+  ): DocumentationEntry[] {
+    if (modLoader === 'neoforge') {
+      return this.searchDocumentationNeoforge(query, mcVersion);
+    }
+    return this.searchDocumentationFabric(query);
+  }
+
+  private searchDocumentationFabric(query: string): DocumentationEntry[] {
     const results: DocumentationEntry[] = [];
     const queryLower = query.toLowerCase();
 
-    // Search known docs
     for (const [className, partialEntry] of Object.entries(KNOWN_DOCS)) {
       if (
         className.toLowerCase().includes(queryLower) ||
@@ -446,16 +734,60 @@ export class DocumentationService {
       }
     }
 
-    // Search wiki pages
     for (const [topic, url] of Object.entries(FABRIC_WIKI_PAGES)) {
       if (topic.includes(queryLower)) {
-        results.push({
+        this.pushIfNew(results, {
           name: topic,
           source: 'fabric_wiki',
           url,
           summary: `Fabric Wiki: ${topic}`,
         });
       }
+    }
+
+    return results;
+  }
+
+  private searchDocumentationNeoforge(query: string, mcVersion?: string): DocumentationEntry[] {
+    const dv = resolveNeoforgedDocsVersion(mcVersion);
+    const results: DocumentationEntry[] = [];
+    const queryLower = query.toLowerCase();
+
+    for (const [className, partialEntry] of Object.entries(KNOWN_DOCS)) {
+      if (
+        className.toLowerCase().includes(queryLower) ||
+        partialEntry.summary?.toLowerCase().includes(queryLower)
+      ) {
+        const neo = this.getNeoforgedDocumentationForClass(className, mcVersion);
+        if (neo) {
+          this.pushIfNew(results, neo);
+        }
+      }
+    }
+
+    for (const [topic, rel] of Object.entries(NEOFORGED_WIKI_REL)) {
+      if (topic.includes(queryLower)) {
+        this.pushIfNew(results, {
+          name: `neoforged/${topic}`,
+          source: 'neoforged_docs',
+          url: buildNeoforgedDocsUrl(dv, rel),
+          summary: `NeoForged ${dv}: ${topic}`,
+        });
+      }
+    }
+
+    if (
+      queryLower.includes('neo') ||
+      queryLower.includes('neoforg') ||
+      queryLower.includes('mdk') ||
+      queryLower.includes('getting started')
+    ) {
+      this.pushIfNew(results, {
+        name: 'neoforged/gettingstarted',
+        source: 'neoforged_docs',
+        url: buildNeoforgedDocsUrl(dv, '/gettingstarted/'),
+        summary: `NeoForged ${dv} — Getting Started (MDK, Gradle, run configs)`,
+      });
     }
 
     return results;
@@ -481,6 +813,32 @@ Common injection types:
 - @Accessor/@Invoker: Create getters/setters for private members
       `.trim(),
       seeAlso: ['SpongePowered Mixin', 'Access Wideners'],
+    };
+  }
+
+  /**
+   * NeoForge / Mixin pointer (use with resources e.g. minecraft://docs/topic/neoforge/mixin).
+   */
+  getNeoforgedMixinDocumentation(mcVersion?: string): DocumentationEntry {
+    const dv = resolveNeoforgedDocsVersion(mcVersion);
+    return {
+      name: 'Mixin (NeoForge)',
+      source: 'neoforged_docs',
+      url: buildNeoforgedDocsUrl(dv, NEOFORGED_WIKI_REL.mixin),
+      summary: `NeoForge uses Mixin; see Getting Started and mod lifecycle (NeoForged ${dv})`,
+    };
+  }
+
+  /**
+   * NeoForge access / visibility pointer (not Fabric Access Widener).
+   */
+  getNeoforgedAccessTransformerPointer(mcVersion?: string): DocumentationEntry {
+    const dv = resolveNeoforgedDocsVersion(mcVersion);
+    return {
+      name: 'Access / visibility (NeoForge)',
+      source: 'neoforged_docs',
+      url: buildNeoforgedDocsUrl(dv, NEOFORGED_WIKI_REL.accesswidener),
+      summary: `NeoForge uses Access Transformers (different from Fabric Access Wideners). See Getting Started and NeoForged docs (${dv})`,
     };
   }
 

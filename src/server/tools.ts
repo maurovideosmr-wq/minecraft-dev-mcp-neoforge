@@ -2,14 +2,20 @@ import { existsSync, readFileSync, readdirSync } from 'node:fs';
 import { join, relative } from 'node:path';
 import { z } from 'zod';
 import { getCacheManager } from '../cache/cache-manager.js';
+import { getNeoForgeDownloader } from '../downloaders/neoforge-downloader.js';
+import { getAccessTransformerService } from '../services/access-transformer-service.js';
 import { getAccessWidenerService } from '../services/access-widener-service.js';
 import { getAstDiffService } from '../services/ast-diff-service.js';
 import { getDecompileService } from '../services/decompile-service.js';
-import { getDocumentationService } from '../services/documentation-service.js';
+import {
+  getDocumentationService,
+  resolveNeoforgedDocsVersion,
+} from '../services/documentation-service.js';
 import { getMappingService } from '../services/mapping-service.js';
 import { getMixinService } from '../services/mixin-service.js';
 import { getModAnalyzerService } from '../services/mod-analyzer-service.js';
 import { getModDecompileService } from '../services/mod-decompile-service.js';
+import { getNeoForgeDecompileService } from '../services/neoforge-decompile-service.js';
 import { getRegistryService } from '../services/registry-service.js';
 import { getRemapService } from '../services/remap-service.js';
 import { getSearchIndexService } from '../services/search-index-service.js';
@@ -72,6 +78,13 @@ const RemapModJarSchema = z.object({
     .optional()
     .describe('Minecraft version the mod is for (auto-detected from mod metadata if not provided)'),
   toMapping: z.enum(['yarn', 'mojmap']).describe('Target mapping type'),
+  modLoader: z
+    .enum(['fabric', 'neoforge'])
+    .optional()
+    .default('fabric')
+    .describe(
+      'Pass "neoforge" to get a clear "not supported" message. This tool is for Fabric (intermediary) JARs. Default: fabric',
+    ),
 });
 
 const FindMappingSchema = z.object({
@@ -101,15 +114,28 @@ const CompareVersionsSchema = z.object({
 });
 
 // Phase 2 Tool Schemas
-const AnalyzeMixinSchema = z.object({
-  source: z
-    .string()
-    .describe(
-      'Mixin source code (Java) or path to a JAR/directory (supports WSL and Windows paths)',
-    ),
-  mcVersion: z.string().describe('Minecraft version to validate against'),
-  mapping: z.enum(['yarn', 'mojmap']).optional().describe('Mapping type (default: yarn)'),
-});
+const AnalyzeMixinSchema = z
+  .object({
+    source: z
+      .string()
+      .describe(
+        'Mixin source code (Java) or path to a JAR/directory (supports WSL and Windows paths)',
+      ),
+    mcVersion: z.string().describe('Minecraft version to validate against'),
+    mapping: z
+      .enum(['yarn', 'mojmap'])
+      .optional()
+      .describe('Mapping type (default: yarn for fabric, mojmap for neoforge modLoader)'),
+    modLoader: z
+      .enum(['fabric', 'neoforge'])
+      .optional()
+      .default('fabric')
+      .describe('Default fabric. NeoForge: mapping defaults to mojmap.'),
+  })
+  .transform((data) => ({
+    ...data,
+    mapping: data.mapping ?? (data.modLoader === 'neoforge' ? 'mojmap' : 'yarn'),
+  }));
 
 const ValidateAccessWidenerSchema = z.object({
   content: z
@@ -119,6 +145,23 @@ const ValidateAccessWidenerSchema = z.object({
     ),
   mcVersion: z.string().describe('Minecraft version to validate against'),
   mapping: z.enum(['yarn', 'mojmap']).optional().describe('Mapping type (default: yarn)'),
+  modLoader: z
+    .enum(['fabric', 'neoforge'])
+    .optional()
+    .default('fabric')
+    .describe('Fabric Access Widener only. If "neoforge", returns AT vs AW guidance; use validate_access_transformer for AT'),
+});
+
+const ValidateAccessTransformerSchema = z.object({
+  content: z
+    .string()
+    .describe('Access Transformer file content, or path to a .cfg file (WSL/Windows)'),
+  mcVersion: z.string().describe('Minecraft version to validate against (need decompiled mojmap sources)'),
+  mapping: z
+    .enum(['yarn', 'mojmap'])
+    .optional()
+    .default('mojmap')
+    .describe('Use mojmap for NeoForge (default); yarn is supported for parity'),
 });
 
 const CompareVersionsDetailedSchema = z.object({
@@ -150,10 +193,32 @@ const SearchIndexedSchema = z.object({
 
 const GetDocumentationSchema = z.object({
   className: z.string().describe('Class name to get documentation for'),
+  modLoader: z
+    .enum(['fabric', 'neoforge'])
+    .optional()
+    .default('fabric')
+    .describe(
+      'Which mod stack the user is on. Use fabric OR neoforge — do not return both. Default fabric.',
+    ),
+  mcVersion: z
+    .string()
+    .optional()
+    .describe(
+      'Minecraft version (e.g. 1.21.1). When modLoader is neoforge, selects NeoForged docs tree unless NEOFORGE_DOCS_VERSION is set.',
+    ),
 });
 
 const SearchDocumentationSchema = z.object({
   query: z.string().describe('Search query for documentation'),
+  modLoader: z
+    .enum(['fabric', 'neoforge'])
+    .optional()
+    .default('fabric')
+    .describe('Which mod stack to search. Default fabric.'),
+  mcVersion: z
+    .string()
+    .optional()
+    .describe('Minecraft version hint for NeoForged doc URLs when modLoader is neoforge'),
 });
 
 // Phase 3 Tool Schemas
@@ -171,55 +236,146 @@ const AnalyzeModJarSchema = z.object({
     .describe('Include raw metadata files (default: false)'),
 });
 
-const DecompileModJarSchema = z.object({
-  jarPath: z
-    .string()
-    .describe(
-      'Path to the mod JAR file to decompile (can be original or remapped, supports WSL and Windows paths)',
-    ),
-  mapping: z
-    .enum(['yarn', 'mojmap'])
-    .describe('Mapping type the JAR uses (yarn or mojmap). Should match how the JAR was remapped.'),
-  modId: z.string().optional().describe('Mod ID (auto-detected from JAR if not provided)'),
-  modVersion: z
+const DecompileModJarSchema = z
+  .object({
+    jarPath: z
+      .string()
+      .describe(
+        'Path to the mod JAR file to decompile (can be original or remapped, supports WSL and Windows paths)',
+      ),
+    mapping: z
+      .enum(['yarn', 'mojmap'])
+      .optional()
+      .describe(
+        'Mapping the JAR uses. If omitted, defaults from modLoader: neoforge → mojmap, fabric → yarn. Explicit mapping always wins.',
+      ),
+    modLoader: z
+      .enum(['fabric', 'neoforge'])
+      .optional()
+      .default('fabric')
+      .describe('Stack hint when mapping is omitted. Default fabric.'),
+    modId: z.string().optional().describe('Mod ID (auto-detected from JAR if not provided)'),
+    modVersion: z
+      .string()
+      .optional()
+      .describe('Mod version (auto-detected from JAR if not provided)'),
+  })
+  .transform((data) => ({
+    ...data,
+    mapping: data.mapping ?? (data.modLoader === 'neoforge' ? 'mojmap' : 'yarn'),
+  }));
+
+const SearchModCodeSchema = z
+  .object({
+    modId: z.string().describe('Mod ID (from analyze_mod_jar or decompile_mod_jar)'),
+    modVersion: z.string().describe('Mod version'),
+    query: z.string().describe('Search query (regex pattern or literal string)'),
+    searchType: z
+      .enum(['class', 'method', 'field', 'content', 'all'])
+      .describe('Type of search: class name, method, field, content, or all'),
+    mapping: z
+      .enum(['yarn', 'mojmap'])
+      .optional()
+      .describe('Same as decompile_mod_jar. If omitted, defaults from modLoader (neoforge → mojmap).'),
+    modLoader: z
+      .enum(['fabric', 'neoforge'])
+      .optional()
+      .default('fabric')
+      .describe('When mapping omitted. Default fabric.'),
+    limit: z.number().optional().describe('Maximum number of results (default: 50)'),
+  })
+  .transform((data) => ({
+    ...data,
+    mapping: data.mapping ?? (data.modLoader === 'neoforge' ? 'mojmap' : 'yarn'),
+  }));
+
+const IndexModSchema = z
+  .object({
+    modId: z.string().describe('Mod ID (from decompile_mod_jar)'),
+    modVersion: z.string().describe('Mod version'),
+    mapping: z
+      .enum(['yarn', 'mojmap'])
+      .optional()
+      .describe('Same as decompile. If omitted, defaults from modLoader.'),
+    modLoader: z
+      .enum(['fabric', 'neoforge'])
+      .optional()
+      .default('fabric')
+      .describe('When mapping omitted. Default fabric.'),
+    force: z
+      .boolean()
+      .optional()
+      .describe('Force re-indexing even if already indexed (default: false)'),
+  })
+  .transform((data) => ({
+    ...data,
+    mapping: data.mapping ?? (data.modLoader === 'neoforge' ? 'mojmap' : 'yarn'),
+  }));
+
+const SearchModIndexedSchema = z
+  .object({
+    query: z
+      .string()
+      .describe('Search query (supports FTS5 syntax: AND, OR, NOT, "phrase", prefix*)'),
+    modId: z.string().describe('Mod ID'),
+    modVersion: z.string().describe('Mod version'),
+    mapping: z
+      .enum(['yarn', 'mojmap'])
+      .optional()
+      .describe('Same as index_mod. If omitted, defaults from modLoader.'),
+    modLoader: z
+      .enum(['fabric', 'neoforge'])
+      .optional()
+      .default('fabric')
+      .describe('When mapping omitted. Default fabric.'),
+    types: z
+      .array(z.enum(['class', 'method', 'field']))
+      .optional()
+      .describe('Entry types to search (omit for all types)'),
+    limit: z.number().optional().describe('Maximum results (default: 100)'),
+  })
+  .transform((data) => ({
+    ...data,
+    mapping: data.mapping ?? (data.modLoader === 'neoforge' ? 'mojmap' : 'yarn'),
+  }));
+
+const DecompileNeoforgeApiSchema = z.object({
+  mcVersion: z.string().describe('Minecraft version (e.g. 1.21.1)'),
+  neoForgeVersion: z
     .string()
     .optional()
-    .describe('Mod version (auto-detected from JAR if not provided)'),
-});
-
-const SearchModCodeSchema = z.object({
-  modId: z.string().describe('Mod ID (from analyze_mod_jar or decompile_mod_jar)'),
-  modVersion: z.string().describe('Mod version'),
-  query: z.string().describe('Search query (regex pattern or literal string)'),
-  searchType: z
-    .enum(['class', 'method', 'field', 'content', 'all'])
-    .describe('Type of search: class name, method, field, content, or all'),
-  mapping: z.enum(['yarn', 'mojmap']).describe('Mapping type used when decompiling'),
-  limit: z.number().optional().describe('Maximum number of results (default: 50)'),
-});
-
-const IndexModSchema = z.object({
-  modId: z.string().describe('Mod ID (from decompile_mod_jar)'),
-  modVersion: z.string().describe('Mod version'),
-  mapping: z.enum(['yarn', 'mojmap']).describe('Mapping type used when decompiling'),
+    .describe(
+      'Full NeoForge Maven version (e.g. 1.21.1-21.1.77). Omit to pick latest for mcVersion from NeoForged Maven metadata.',
+    ),
   force: z
     .boolean()
     .optional()
-    .describe('Force re-indexing even if already indexed (default: false)'),
+    .describe('Re-run Vineflower even if decompiled sources already exist (default: false)'),
 });
 
-const SearchModIndexedSchema = z.object({
+const IndexNeoforgeApiSchema = z.object({
+  mcVersion: z.string().describe('Minecraft version'),
+  neoForgeVersion: z.string().optional().describe('NeoForge Maven version; omit to resolve from Maven'),
+  force: z
+    .boolean()
+    .optional()
+    .describe('Force re-decompile and full re-index (default: false)'),
+});
+
+const SearchNeoforgeApiSchema = z.object({
   query: z
     .string()
-    .describe('Search query (supports FTS5 syntax: AND, OR, NOT, "phrase", prefix*)'),
-  modId: z.string().describe('Mod ID'),
-  modVersion: z.string().describe('Mod version'),
-  mapping: z.enum(['yarn', 'mojmap']).describe('Mapping type'),
+    .describe('FTS5 query (AND, OR, NOT, "phrase", prefix*)'),
+  mcVersion: z.string().describe('Minecraft version (must match index)'),
+  neoForgeVersion: z
+    .string()
+    .optional()
+    .describe('NeoForge version used when indexing; omit to use latest indexed for this MC version'),
   types: z
     .array(z.enum(['class', 'method', 'field']))
     .optional()
-    .describe('Entry types to search (omit for all types)'),
-  limit: z.number().optional().describe('Maximum results (default: 100)'),
+    .describe('Filter by entry types'),
+  limit: z.number().optional().describe('Max results (default: 100)'),
 });
 
 // Tool definitions
@@ -227,7 +383,7 @@ export const tools = [
   {
     name: 'get_minecraft_source',
     description:
-      'Get decompiled source code for a specific Minecraft class. This will automatically download, remap, and decompile the Minecraft version if not cached.',
+      'Get decompiled source code for a specific Minecraft class. This will automatically download, remap, and decompile the Minecraft version if not cached. For NeoForge mod development against vanilla, prefer mapping "mojmap" (Mojang names). Fabric-oriented workflows often use "yarn".',
     inputSchema: {
       type: 'object',
       properties: {
@@ -242,7 +398,8 @@ export const tools = [
         mapping: {
           type: 'string',
           enum: ['yarn', 'mojmap'],
-          description: 'Mapping type to use',
+          description:
+            'Mapping: mojmap matches Mojang/NeoForge dev; yarn matches typical Fabric Loom',
         },
         startLine: {
           type: 'number',
@@ -266,7 +423,7 @@ export const tools = [
   {
     name: 'decompile_minecraft_version',
     description:
-      'Decompile an entire Minecraft version. This downloads the client JAR, remaps it, and decompiles all classes. Subsequent calls will use cached results.',
+      'Decompile an entire Minecraft version. This downloads the client JAR, remaps it, and decompiles all classes. Subsequent calls will use cached results. NeoForge users: use mapping "mojmap" to align with Mojang names in MDK; Fabric users often use "yarn".',
     inputSchema: {
       type: 'object',
       properties: {
@@ -277,7 +434,7 @@ export const tools = [
         mapping: {
           type: 'string',
           enum: ['yarn', 'mojmap'],
-          description: 'Mapping type to use',
+          description: 'mojmap for NeoForge-style Mojang names; yarn for Fabric',
         },
         force: {
           type: 'boolean',
@@ -319,7 +476,7 @@ export const tools = [
   {
     name: 'remap_mod_jar',
     description:
-      'Remap a Fabric mod JAR from intermediary mappings to human-readable mappings. Useful for reading mod source code. Supports both WSL (/mnt/c/...) and Windows (C:\\...) paths.',
+      'Remap a Fabric mod JAR from intermediary to yarn/mojmap (tiny-remapper). NeoForge/MDK builds do not use this path — pass modLoader "neoforge" to return an explicit error and guidance, or use decompile_mod_jar with mojmap for readable mod sources.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -341,6 +498,11 @@ export const tools = [
           enum: ['yarn', 'mojmap'],
           description: 'Target mapping type',
         },
+        modLoader: {
+          type: 'string',
+          enum: ['fabric', 'neoforge'],
+          description: 'Default fabric. If neoforge, the tool will not run remapping and returns a reason.',
+        },
       },
       required: ['inputJar', 'outputJar', 'toMapping'],
     },
@@ -348,7 +510,7 @@ export const tools = [
   {
     name: 'find_mapping',
     description:
-      'Look up a symbol (class, method, or field) mapping between different mapping systems. Translates between official (obfuscated), intermediary, yarn, and mojmap names. Use "official" for obfuscated names like "a", "b", "c".',
+      'Look up a symbol (class, method, or field) mapping between different mapping systems. Translates between official (obfuscated), intermediary, yarn, and mojmap names. Use "official" for obfuscated names like "a", "b", "c". For NeoForge-style Mojang names, use mojmap in source/target. Intermediary is Fabric-centric.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -379,7 +541,7 @@ export const tools = [
   {
     name: 'search_minecraft_code',
     description:
-      'Search for classes, methods, fields, or content in decompiled Minecraft source code. Supports regex patterns.',
+      'Search for classes, methods, fields, or content in decompiled Minecraft source code. Supports regex patterns. For NeoForge, prefer decompiling and searching with mapping "mojmap".',
     inputSchema: {
       type: 'object',
       properties: {
@@ -399,7 +561,7 @@ export const tools = [
         mapping: {
           type: 'string',
           enum: ['yarn', 'mojmap'],
-          description: 'Mapping type',
+          description: 'mojmap for NeoForge; yarn for Fabric',
         },
         limit: {
           type: 'number',
@@ -412,7 +574,7 @@ export const tools = [
   {
     name: 'compare_versions',
     description:
-      'Compare two Minecraft versions to find differences in classes or registry data. Useful for tracking breaking changes between versions.',
+      'Compare two Minecraft versions to find differences in classes or registry data. Useful for tracking breaking changes between versions. NeoForge modders: use "mojmap" to match Mojang-named sources.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -442,7 +604,7 @@ export const tools = [
   {
     name: 'analyze_mixin',
     description:
-      'Analyze and validate Mixin code against Minecraft source. Parses @Mixin annotations, validates injection targets, and suggests fixes for issues. Supports both WSL (/mnt/c/...) and Windows (C:\\...) paths.',
+      'Analyze and validate Mixin code against Minecraft source. Parses @Mixin annotations, validates injection targets, and suggests fixes for issues. Supports both WSL (/mnt/c/...) and Windows (C:\\...) paths. NeoForge projects: pass mapping "mojmap" to validate against Mojang names.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -457,7 +619,12 @@ export const tools = [
         mapping: {
           type: 'string',
           enum: ['yarn', 'mojmap'],
-          description: 'Mapping type (default: yarn)',
+          description: 'Optional; defaults to mojmap when modLoader is neoforge, else yarn',
+        },
+        modLoader: {
+          type: 'string',
+          enum: ['fabric', 'neoforge'],
+          description: 'Default fabric. NeoForge sets default mapping to mojmap',
         },
       },
       required: ['source', 'mcVersion'],
@@ -466,7 +633,7 @@ export const tools = [
   {
     name: 'validate_access_widener',
     description:
-      'Parse and validate Fabric Access Widener files against Minecraft source. Checks that targets exist and suggests fixes. Supports both WSL (/mnt/c/...) and Windows (C:\\...) paths.',
+      'Parse and validate **Fabric** Access Widener (.accesswidener v2) only. NeoForge uses Access Transformers — use validate_access_transformer. Set modLoader "neoforge" here to get a short pointer instead of parsing.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -482,8 +649,30 @@ export const tools = [
         mapping: {
           type: 'string',
           enum: ['yarn', 'mojmap'],
-          description: 'Mapping type (default: yarn)',
+          description: 'Mapping type (default: yarn). NeoForge: prefer mojmap when validating',
         },
+        modLoader: {
+          type: 'string',
+          enum: ['fabric', 'neoforge'],
+          description: 'Default fabric. If neoforge, no AW validation — returns use validate_access_transformer',
+        },
+      },
+      required: ['content', 'mcVersion'],
+    },
+  },
+  {
+    name: 'validate_access_transformer',
+    description:
+      'Parse **NeoForge/Forge** Access Transformer files (not Fabric access widener). Best-effort line parse, then check that target classes exist in decompiled mojmap (or yarn) sources. Use mapping mojmap for NeoForge. Run decompile_minecraft_version first.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        content: {
+          type: 'string',
+          description: 'AT file content or file path (WSL/Windows)',
+        },
+        mcVersion: { type: 'string', description: 'Minecraft version' },
+        mapping: { type: 'string', enum: ['yarn', 'mojmap'], description: 'Default mojmap' },
       },
       required: ['content', 'mcVersion'],
     },
@@ -491,7 +680,7 @@ export const tools = [
   {
     name: 'compare_versions_detailed',
     description:
-      'Compare two Minecraft versions with detailed AST-level analysis. Shows method signature changes, field changes, and breaking API changes.',
+      'Compare two Minecraft versions with detailed AST-level analysis. Shows method signature changes, field changes, and breaking API changes. NeoForge: use mapping "mojmap".',
     inputSchema: {
       type: 'object',
       properties: {
@@ -524,7 +713,7 @@ export const tools = [
   {
     name: 'index_minecraft_version',
     description:
-      'Create a full-text search index for decompiled Minecraft source. Enables fast searching with search_indexed tool.',
+      'Create a full-text search index for decompiled Minecraft source. Enables fast searching with search_indexed tool. For NeoForge workflows, build the index with "mojmap" to match MDK decompiled names.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -544,7 +733,7 @@ export const tools = [
   {
     name: 'search_indexed',
     description:
-      'Fast full-text search using pre-built index. Much faster than search_minecraft_code for large queries. Requires index_minecraft_version first.',
+      'Fast full-text search using pre-built index. Much faster than search_minecraft_code for large queries. Requires index_minecraft_version first. Use the same mapping you indexed (mojmap for NeoForge, yarn for many Fabric projects).',
     inputSchema: {
       type: 'object',
       properties: {
@@ -577,7 +766,7 @@ export const tools = [
   {
     name: 'get_documentation',
     description:
-      'Get documentation for a Minecraft class or concept. Links to Fabric Wiki, Minecraft Wiki, and provides usage hints.',
+      'Get documentation for a Minecraft class or concept. You MUST set modLoader to match the user project: "fabric" (Fabric Wiki) or "neoforge" (NeoForged 1.21.1 docs). Do not use both in one call — pick one stack.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -585,19 +774,39 @@ export const tools = [
           type: 'string',
           description: 'Class name to get documentation for',
         },
+        modLoader: {
+          type: 'string',
+          enum: ['fabric', 'neoforge'],
+          description:
+            'Docs: fabric = Fabric Wiki; neoforge = docs.neoforged.net. Doc tree: env NEOFORGE_DOCS_VERSION or mcVersion mapping.',
+        },
+        mcVersion: {
+          type: 'string',
+          description: 'Optional MC version for NeoForged docs path when modLoader is neoforge',
+        },
       },
       required: ['className'],
     },
   },
   {
     name: 'search_documentation',
-    description: 'Search for documentation across all known Minecraft/Fabric topics.',
+    description:
+      'Search modding documentation. Set modLoader to "fabric" or "neoforge" to match the user project — one stack per call, not both.',
     inputSchema: {
       type: 'object',
       properties: {
         query: {
           type: 'string',
           description: 'Search query',
+        },
+        modLoader: {
+          type: 'string',
+          enum: ['fabric', 'neoforge'],
+          description: 'Default fabric.',
+        },
+        mcVersion: {
+          type: 'string',
+          description: 'Optional MC version for NeoForged doc URLs when modLoader is neoforge',
         },
       },
       required: ['query'],
@@ -631,7 +840,7 @@ export const tools = [
   {
     name: 'decompile_mod_jar',
     description:
-      'Decompile a mod JAR file to readable Java source code. The JAR can be either the original mod JAR (with intermediary mappings) or a remapped JAR (from remap_mod_jar). Decompiled sources are cached in AppData/decompiled-mods/{modId}/{modVersion}/{mapping}/. Mod ID and version are auto-detected from the JAR metadata if not provided. Supports both WSL (/mnt/c/...) and Windows (C:\\...) paths.',
+      'Decompile a mod JAR to readable Java. The JAR can be a Fabric (intermediary) build or a remapped JAR from remap_mod_jar, or a NeoForge mod in Mojang names. Mapping: set mapping explicitly, or set modLoader to neoforge (defaults mojmap) or fabric (defaults yarn). Cache: AppData/decompiled-mods/{modId}/{modVersion}/{mapping}/. Auto-detects mod ID and version. WSL/Windows paths.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -643,7 +852,13 @@ export const tools = [
         mapping: {
           type: 'string',
           enum: ['yarn', 'mojmap'],
-          description: 'Mapping type the JAR uses (should match how it was remapped)',
+          description:
+            'Omit to use modLoader defaults (neoforge → mojmap, fabric → yarn). If set, overrides modLoader.',
+        },
+        modLoader: {
+          type: 'string',
+          enum: ['fabric', 'neoforge'],
+          description: 'When mapping is omitted: fabric (default) → yarn; neoforge → mojmap',
         },
         modId: {
           type: 'string',
@@ -654,13 +869,13 @@ export const tools = [
           description: 'Mod version (optional, auto-detected if not provided)',
         },
       },
-      required: ['jarPath', 'mapping'],
+      required: ['jarPath'],
     },
   },
   {
     name: 'search_mod_code',
     description:
-      'Search for classes, methods, fields, or content in decompiled mod source code. Supports regex patterns. Use after decompile_mod_jar to search through a decompiled mod.',
+      'Search decompiled mod source (after decompile_mod_jar). Use the same mapping as decompile, or modLoader (neoforge → mojmap, fabric → yarn) when mapping omitted.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -684,20 +899,25 @@ export const tools = [
         mapping: {
           type: 'string',
           enum: ['yarn', 'mojmap'],
-          description: 'Mapping type used when decompiling',
+          description: 'Omit for modLoader defaults. Same as decompile_mod_jar if set.',
+        },
+        modLoader: {
+          type: 'string',
+          enum: ['fabric', 'neoforge'],
+          description: 'When mapping omitted: fabric (default) → yarn; neoforge → mojmap',
         },
         limit: {
           type: 'number',
           description: 'Maximum number of results (default: 50)',
         },
       },
-      required: ['modId', 'modVersion', 'query', 'searchType', 'mapping'],
+      required: ['modId', 'modVersion', 'query', 'searchType'],
     },
   },
   {
     name: 'index_mod',
     description:
-      'Create a full-text search index for decompiled mod source code. Enables fast searching with search_mod_indexed tool. Use after decompile_mod_jar.',
+      'Index decompiled mod source for search_mod_indexed. After decompile_mod_jar: same mapping as decompile, or modLoader only (neoforge → mojmap, fabric → yarn).',
     inputSchema: {
       type: 'object',
       properties: {
@@ -712,14 +932,19 @@ export const tools = [
         mapping: {
           type: 'string',
           enum: ['yarn', 'mojmap'],
-          description: 'Mapping type used when decompiling',
+          description: 'Omit for modLoader defaults. Must match decompile_mod_jar if set.',
+        },
+        modLoader: {
+          type: 'string',
+          enum: ['fabric', 'neoforge'],
+          description: 'When mapping omitted: fabric (default) → yarn; neoforge → mojmap',
         },
         force: {
           type: 'boolean',
           description: 'Force re-indexing even if already indexed (default: false)',
         },
       },
-      required: ['modId', 'modVersion', 'mapping'],
+      required: ['modId', 'modVersion'],
     },
   },
   {
@@ -744,7 +969,12 @@ export const tools = [
         mapping: {
           type: 'string',
           enum: ['yarn', 'mojmap'],
-          description: 'Mapping type',
+          description: 'Omit for modLoader defaults. Must match index_mod if set.',
+        },
+        modLoader: {
+          type: 'string',
+          enum: ['fabric', 'neoforge'],
+          description: 'When mapping omitted: fabric (default) → yarn; neoforge → mojmap',
         },
         types: {
           type: 'array',
@@ -759,7 +989,60 @@ export const tools = [
           description: 'Maximum results (default: 100)',
         },
       },
-      required: ['query', 'modId', 'modVersion', 'mapping'],
+      required: ['query', 'modId', 'modVersion'],
+    },
+  },
+  {
+    name: 'decompile_neoforge_api',
+    description:
+      'Download NeoForge universal JAR for a Minecraft version and decompile it to Java sources (net.neoforged API). Use alongside decompile_minecraft_version with mojmap for vanilla + NeoForge development. Caches under AppData.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        mcVersion: { type: 'string', description: 'Minecraft version (e.g. 1.21.1)' },
+        neoForgeVersion: {
+          type: 'string',
+          description: 'Full Maven version or omit for latest matching MC',
+        },
+        force: { type: 'boolean', description: 'Re-decompile even if cache exists' },
+      },
+      required: ['mcVersion'],
+    },
+  },
+  {
+    name: 'index_neoforge_api',
+    description:
+      'Build FTS5 search index for decompiled NeoForge API sources. Runs decompile_neoforge_api first if needed. Pair with search_neoforge_api.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        mcVersion: { type: 'string', description: 'Minecraft version' },
+        neoForgeVersion: { type: 'string', description: 'NeoForge Maven version or omit to resolve' },
+        force: { type: 'boolean', description: 'Force re-decompile and re-index' },
+      },
+      required: ['mcVersion'],
+    },
+  },
+  {
+    name: 'search_neoforge_api',
+    description:
+      'Full-text search in indexed NeoForge API sources (requires index_neoforge_api). FTS5 syntax.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        query: { type: 'string', description: 'FTS5 search query' },
+        mcVersion: { type: 'string', description: 'Minecraft version' },
+        neoForgeVersion: {
+          type: 'string',
+          description: 'Indexed NeoForge version or omit for latest indexed',
+        },
+        types: {
+          type: 'array',
+          items: { type: 'string', enum: ['class', 'method', 'field'] },
+        },
+        limit: { type: 'number', description: 'Max results (default 100)' },
+      },
+      required: ['query', 'mcVersion'],
     },
   },
 ];
@@ -972,7 +1255,29 @@ export async function handleRemapModJar(args: unknown) {
     outputJar,
     mcVersion: providedMcVersion,
     toMapping,
+    modLoader = 'fabric',
   } = RemapModJarSchema.parse(args);
+
+  if (modLoader === 'neoforge') {
+    return {
+      content: [
+        {
+          type: 'text',
+          text: JSON.stringify(
+            {
+              success: false,
+              modLoader: 'neoforge',
+              message:
+                'This tool remaps Fabric-style mod JARs from intermediary to yarn/mojmap. NeoForge/MDK builds are not remapped the same way; use Gradle in your mod project, or decompile_mod_jar with mapping mojmap for reading sources.',
+            },
+            null,
+            2,
+          ),
+        },
+      ],
+      isError: true,
+    };
+  }
 
   // Normalize paths for cross-platform support (WSL/Windows)
   const normalizedInputJar = normalizePath(inputJar);
@@ -1374,9 +1679,9 @@ export async function handleCompareVersions(args: unknown) {
 
 // Handler for analyze_mixin
 export async function handleAnalyzeMixin(args: unknown) {
-  const { source, mcVersion, mapping = 'yarn' } = AnalyzeMixinSchema.parse(args);
+  const { source, mcVersion, mapping, modLoader } = AnalyzeMixinSchema.parse(args);
 
-  logger.info(`Analyzing mixin for MC ${mcVersion} (${mapping})`);
+  logger.info(`Analyzing mixin for MC ${mcVersion} (${mapping}, modLoader=${modLoader})`);
 
   const mixinService = getMixinService();
 
@@ -1390,14 +1695,50 @@ export async function handleAnalyzeMixin(args: unknown) {
     if (existsSync(normalizedSource)) {
       // It's a path - could be JAR, directory, or single file
       if (normalizedSource.endsWith('.jar')) {
-        const mixins = await mixinService.parseMixinsFromJar(normalizedSource);
-        if (mixins.length === 0) {
+        const jarAnalysis = await mixinService.analyzeMixinsFromJar(normalizedSource);
+
+        if (jarAnalysis.validationLevel === 'none') {
           return {
-            content: [{ type: 'text', text: 'No mixins found in JAR file' }],
+            content: [
+              {
+                type: 'text',
+                text: JSON.stringify(
+                  {
+                    error: 'No mixin configs or Java mixin sources found in JAR',
+                    configPaths: jarAnalysis.configPaths,
+                  },
+                  null,
+                  2,
+                ),
+              },
+            ],
+            isError: true,
           };
         }
 
-        // Validate all mixins
+        if (jarAnalysis.validationLevel === 'partial') {
+          return {
+            content: [
+              {
+                type: 'text',
+                text: JSON.stringify(
+                  {
+                    validationLevel: 'partial',
+                    modLoader,
+                    mapping,
+                    configPaths: jarAnalysis.configPaths,
+                    mixinClassNamesFromConfig: jarAnalysis.mixinClassNamesFromConfig,
+                    note: jarAnalysis.note,
+                  },
+                  null,
+                  2,
+                ),
+              },
+            ],
+          };
+        }
+
+        const { mixins } = jarAnalysis;
         const results = await Promise.all(
           mixins.map((m) => mixinService.validateMixin(m, mcVersion, mapping as MappingType)),
         );
@@ -1408,6 +1749,10 @@ export async function handleAnalyzeMixin(args: unknown) {
               type: 'text',
               text: JSON.stringify(
                 {
+                  validationLevel: 'full',
+                  modLoader,
+                  mapping,
+                  configPaths: jarAnalysis.configPaths,
                   totalMixins: mixins.length,
                   validMixins: results.filter((r) => r.isValid).length,
                   invalidMixins: results.filter((r) => !r.isValid).length,
@@ -1486,7 +1831,28 @@ export async function handleAnalyzeMixin(args: unknown) {
 
 // Handler for validate_access_widener
 export async function handleValidateAccessWidener(args: unknown) {
-  const { content, mcVersion, mapping = 'yarn' } = ValidateAccessWidenerSchema.parse(args);
+  const { content, mcVersion, mapping = 'yarn', modLoader = 'fabric' } =
+    ValidateAccessWidenerSchema.parse(args);
+
+  if (modLoader === 'neoforge') {
+    return {
+      content: [
+        {
+          type: 'text',
+          text: JSON.stringify(
+            {
+              skipped: true,
+              reason:
+                'Fabric Access Widener files (.accesswidener v2, header accessWidener) are not NeoForge Access Transformers.',
+              useInstead: 'validate_access_transformer',
+            },
+            null,
+            2,
+          ),
+        },
+      ],
+    };
+  }
 
   logger.info(`Validating access widener for MC ${mcVersion} (${mapping})`);
 
@@ -1532,6 +1898,58 @@ export async function handleValidateAccessWidener(args: unknown) {
     };
   } catch (error) {
     logger.error('Failed to validate access widener', error);
+    return {
+      content: [
+        {
+          type: 'text',
+          text: `Error: ${error instanceof Error ? error.message : 'Unknown error'}`,
+        },
+      ],
+      isError: true,
+    };
+  }
+}
+
+// Handler for validate_access_transformer (Forge / NeoForge AT)
+export async function handleValidateAccessTransformer(args: unknown) {
+  const { content, mcVersion, mapping = 'mojmap' } = ValidateAccessTransformerSchema.parse(args);
+
+  logger.info(`Validating access transformer for MC ${mcVersion} (${mapping})`);
+
+  const atService = getAccessTransformerService();
+
+  try {
+    const normalizedContent = normalizePath(content);
+    const text = existsSync(normalizedContent) ? readFileSync(normalizedContent, 'utf8') : content;
+    const { lines, errors: parseFormErrors } = atService.parseFile(
+      text,
+      existsSync(normalizedContent) ? normalizedContent : undefined,
+    );
+    const validation = await atService.validateAgainstMinecraft(
+      lines,
+      mcVersion,
+      mapping as MappingType,
+    );
+
+    return {
+      content: [
+        {
+          type: 'text',
+          text: JSON.stringify(
+            {
+              kind: 'access_transformer',
+              entryCount: lines.length,
+              parseFormErrors,
+              classValidation: validation,
+            },
+            null,
+            2,
+          ),
+        },
+      ],
+    };
+  } catch (error) {
+    logger.error('Failed to validate access transformer', error);
     return {
       content: [
         {
@@ -1685,31 +2103,44 @@ export async function handleSearchIndexed(args: unknown) {
 
 // Handler for get_documentation
 export async function handleGetDocumentation(args: unknown) {
-  const { className } = GetDocumentationSchema.parse(args);
+  const { className, modLoader, mcVersion } = GetDocumentationSchema.parse(args);
 
-  logger.info(`Getting documentation for ${className}`);
+  logger.info(`Getting documentation for ${className} (${modLoader})`);
 
   const docService = getDocumentationService();
 
   try {
-    const docs = await docService.getRelatedDocumentation(className);
+    const docs = await docService.getRelatedDocumentation(className, modLoader, mcVersion);
 
     if (docs.length === 0) {
       return {
         content: [
           {
             type: 'text',
-            text: `No documentation found for ${className}`,
+            text: `No documentation found for ${className} (modLoader=${modLoader})`,
           },
         ],
       };
     }
 
+    const resolvedNeoforgedDocsVersion =
+      modLoader === 'neoforge' ? resolveNeoforgedDocsVersion(mcVersion) : undefined;
+
     return {
       content: [
         {
           type: 'text',
-          text: JSON.stringify(docs, null, 2),
+          text: JSON.stringify(
+            {
+              modLoader,
+              className,
+              mcVersion,
+              resolvedNeoforgedDocsVersion,
+              results: docs,
+            },
+            null,
+            2,
+          ),
         },
       ],
     };
@@ -1729,14 +2160,14 @@ export async function handleGetDocumentation(args: unknown) {
 
 // Handler for search_documentation
 export async function handleSearchDocumentation(args: unknown) {
-  const { query } = SearchDocumentationSchema.parse(args);
+  const { query, modLoader, mcVersion } = SearchDocumentationSchema.parse(args);
 
-  logger.info(`Searching documentation: ${query}`);
+  logger.info(`Searching documentation: ${query} (${modLoader})`);
 
   const docService = getDocumentationService();
 
   try {
-    const results = docService.searchDocumentation(query);
+    const results = docService.searchDocumentation(query, modLoader, mcVersion);
 
     return {
       content: [
@@ -1745,6 +2176,10 @@ export async function handleSearchDocumentation(args: unknown) {
           text: JSON.stringify(
             {
               query,
+              modLoader,
+              mcVersion,
+              resolvedNeoforgedDocsVersion:
+                modLoader === 'neoforge' ? resolveNeoforgedDocsVersion(mcVersion) : undefined,
               count: results.length,
               results,
             },
@@ -1963,6 +2398,138 @@ export async function handleIndexMod(args: unknown) {
     };
   } catch (error) {
     logger.error('Failed to index mod', error);
+    return {
+      content: [
+        {
+          type: 'text',
+          text: `Error: ${error instanceof Error ? error.message : 'Unknown error'}`,
+        },
+      ],
+      isError: true,
+    };
+  }
+}
+
+export async function handleDecompileNeoforgeApi(args: unknown) {
+  const { mcVersion, neoForgeVersion, force } = DecompileNeoforgeApiSchema.parse(args);
+  const svc = getNeoForgeDecompileService();
+  try {
+    const { outputDir, neoForgeVersion: resolved, jarPath } = await svc.decompileApi(
+      mcVersion,
+      neoForgeVersion,
+      { force },
+    );
+    return {
+      content: [
+        {
+          type: 'text',
+          text: JSON.stringify(
+            {
+              mcVersion,
+              neoForgeVersion: resolved,
+              jarPath,
+              outputDir,
+              message: `NeoForge API sources ready at ${outputDir}`,
+            },
+            null,
+            2,
+          ),
+        },
+      ],
+    };
+  } catch (error) {
+    logger.error('decompile_neoforge_api failed', error);
+    return {
+      content: [
+        {
+          type: 'text',
+          text: `Error: ${error instanceof Error ? error.message : 'Unknown error'}`,
+        },
+      ],
+      isError: true,
+    };
+  }
+}
+
+export async function handleIndexNeoforgeApi(args: unknown) {
+  const { mcVersion, neoForgeVersion, force } = IndexNeoforgeApiSchema.parse(args);
+  const dl = getNeoForgeDownloader();
+  const neoSvc = getNeoForgeDecompileService();
+  const search = getSearchIndexService();
+  try {
+    const resolved = await dl.resolveNeoForgeVersion(mcVersion, neoForgeVersion);
+    await neoSvc.decompileApi(mcVersion, resolved, { force: force ?? false });
+    const result = await search.indexNeoforgeApi(mcVersion, resolved);
+    return {
+      content: [
+        {
+          type: 'text',
+          text: JSON.stringify(
+            {
+              mcVersion,
+              neoForgeVersion: resolved,
+              filesIndexed: result.fileCount,
+              durationMs: result.duration,
+              message: `Indexed ${result.fileCount} NeoForge API files`,
+            },
+            null,
+            2,
+          ),
+        },
+      ],
+    };
+  } catch (error) {
+    logger.error('index_neoforge_api failed', error);
+    return {
+      content: [
+        {
+          type: 'text',
+          text: `Error: ${error instanceof Error ? error.message : 'Unknown error'}`,
+        },
+      ],
+      isError: true,
+    };
+  }
+}
+
+export async function handleSearchNeoforgeApi(args: unknown) {
+  const { query, mcVersion, neoForgeVersion, types, limit = 100 } =
+    SearchNeoforgeApiSchema.parse(args);
+  const search = getSearchIndexService();
+  try {
+    let neo = neoForgeVersion?.trim();
+    if (!neo) {
+      neo = search.getLatestIndexedNeoForgeVersion(mcVersion);
+      if (!neo) {
+        return {
+          content: [
+            {
+              type: 'text',
+              text: `No NeoForge API index for MC ${mcVersion}. Run index_neoforge_api first (optionally pass neoForgeVersion).`,
+            },
+          ],
+          isError: true,
+        };
+      }
+    }
+    const results = search.searchNeoforgeApi(query, mcVersion, neo, {
+      types: types as Array<'class' | 'method' | 'field'> | undefined,
+      limit,
+    });
+    return {
+      content: [
+        {
+          type: 'text',
+          text: JSON.stringify(
+            { query, mcVersion, neoForgeVersion: neo, count: results.length, results },
+            null,
+            2,
+          ),
+        },
+      ],
+    };
+  } catch (error) {
+    logger.error('search_neoforge_api failed', error);
     return {
       content: [
         {
@@ -2202,6 +2769,8 @@ export async function handleToolCall(name: string, args: unknown) {
       return handleAnalyzeMixin(args);
     case 'validate_access_widener':
       return handleValidateAccessWidener(args);
+    case 'validate_access_transformer':
+      return handleValidateAccessTransformer(args);
     case 'compare_versions_detailed':
       return handleCompareVersionsDetailed(args);
     case 'index_minecraft_version':
@@ -2223,7 +2792,21 @@ export async function handleToolCall(name: string, args: unknown) {
       return handleIndexMod(args);
     case 'search_mod_indexed':
       return handleSearchModIndexed(args);
+    case 'decompile_neoforge_api':
+      return handleDecompileNeoforgeApi(args);
+    case 'index_neoforge_api':
+      return handleIndexNeoforgeApi(args);
+    case 'search_neoforge_api':
+      return handleSearchNeoforgeApi(args);
     default:
       throw new Error(`Unknown tool: ${name}`);
   }
 }
+
+/** Exported for unit tests (modLoader + default mapping). */
+export {
+  DecompileModJarSchema,
+  IndexModSchema,
+  SearchModCodeSchema,
+  SearchModIndexedSchema,
+};

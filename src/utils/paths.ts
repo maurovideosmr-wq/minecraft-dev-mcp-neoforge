@@ -58,6 +58,8 @@ export const paths = {
   remapped: () => join(getCacheDir(), 'remapped'),
   decompiled: () => join(getCacheDir(), 'decompiled'),
   decompiledMods: () => join(getCacheDir(), 'decompiled-mods'),
+  decompiledNeoforge: () => join(getCacheDir(), 'decompiled-neoforge'),
+  neoforgeJars: () => join(getCacheDir(), 'neoforge', 'jars'),
   registry: () => join(getCacheDir(), 'registry'),
   resources: () => join(getCacheDir(), 'resources'),
   database: () => join(getCacheDir(), 'cache.db'),
@@ -143,4 +145,22 @@ export function pathToClassName(filePath: string): string {
  */
 export function getDecompiledModPath(modId: string, modVersion: string, mapping: string): string {
   return join(paths.decompiledMods(), modId, modVersion, mapping);
+}
+
+function safePathSegment(s: string): string {
+  return s.replace(/[^a-zA-Z0-9._-]/g, '_');
+}
+
+/** Cached NeoForge universal JAR path */
+export function getNeoforgeJarPath(neoForgeVersion: string): string {
+  return join(paths.neoforgeJars(), `neoforge-${safePathSegment(neoForgeVersion)}-universal.jar`);
+}
+
+/** Decompiled NeoForge API sources (Vineflower output) */
+export function getDecompiledNeoforgePath(mcVersion: string, neoForgeVersion: string): string {
+  return join(
+    paths.decompiledNeoforge(),
+    safePathSegment(mcVersion),
+    safePathSegment(neoForgeVersion),
+  );
 }

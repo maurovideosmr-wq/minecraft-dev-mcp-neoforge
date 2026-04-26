@@ -12,7 +12,12 @@ import type {
   ModMixinConfig,
   ModPerson,
 } from '../types/minecraft.js';
+import {
+  type ForgeTomlDependency,
+  parseForgeModToml,
+} from '../utils/forge-toml-blocks.js';
 import { logger } from '../utils/logger.js';
+import { parseMixinConfigsFromZip } from './mixin-config-reader.js';
 
 /**
  * Options for mod analysis
@@ -95,23 +100,6 @@ interface QuiltModJson {
 }
 
 /**
- * Mixin config JSON structure
- */
-interface MixinConfigJson {
-  required?: boolean;
-  package?: string;
-  compatibilityLevel?: string;
-  mixins?: string[];
-  client?: string[];
-  server?: string[];
-  injectors?: {
-    defaultRequire?: number;
-  };
-  refmap?: string;
-  minVersion?: string;
-}
-
-/**
  * Service for analyzing third-party mod JARs
  */
 export class ModAnalyzerService {
@@ -141,7 +129,7 @@ export class ModAnalyzerService {
     const metadata = await this.parseMetadata(zip, loaderInfo.loader);
 
     // Parse mixin configs
-    const mixinConfigs = this.parseMixinConfigs(zip, metadata.mixinConfigFiles);
+    const mixinConfigs = parseMixinConfigsFromZip(zip, metadata.mixinConfigFiles);
 
     // Analyze classes
     const classAnalysis = await this.analyzeClasses(
@@ -181,16 +169,28 @@ export class ModAnalyzerService {
       entrypoints: metadata.entrypoints,
       mixins: mixinConfigs,
       accessWidener: metadata.accessWidener,
+      accessTransformerFiles: metadata.accessTransformerFiles,
       classes: classAnalysis,
       nestedJars: metadata.nestedJars,
     };
 
     if (options.includeRawMetadata) {
-      result.rawMetadata = {
+      const raw: ModAnalysisResult['rawMetadata'] = {
         fabricModJson: loaderInfo.fabricModJson,
         quiltModJson: loaderInfo.quiltModJson,
         mixinConfigs: this.getRawMixinConfigs(zip, metadata.mixinConfigFiles),
       };
+      if (loaderInfo.loader === 'neoforge' || loaderInfo.loader === 'forge') {
+        const tomlPath =
+          loaderInfo.loader === 'neoforge'
+            ? 'META-INF/neoforge.mods.toml'
+            : 'META-INF/mods.toml';
+        const tomlEnt = zip.getEntry(tomlPath);
+        if (tomlEnt) {
+          raw.modsToml = tomlEnt.getData().toString('utf8');
+        }
+      }
+      result.rawMetadata = raw;
     }
 
     logger.info(
@@ -251,6 +251,35 @@ export class ModAnalyzerService {
     return { loader: 'unknown' };
   }
 
+  private forgeTomlDependencyToMod(d: ForgeTomlDependency): ModDependency {
+    let type: DependencyType = 'required';
+    let mandatory = true;
+    switch (d.dependencyKind) {
+      case 'optional':
+        type = 'optional';
+        mandatory = false;
+        break;
+      case 'incompatible':
+        type = 'incompatible';
+        mandatory = true;
+        break;
+      case 'discouraged':
+        type = 'suggests';
+        mandatory = false;
+        break;
+      default:
+        type = 'required';
+        mandatory = true;
+    }
+    return {
+      modId: d.modId,
+      versionRange: d.versionRange,
+      type,
+      mandatory,
+      side: d.side,
+    };
+  }
+
   /**
    * Parse mod metadata based on loader type
    */
@@ -275,6 +304,7 @@ export class ModAnalyzerService {
     entrypoints: ModEntrypoint[];
     mixinConfigFiles: string[];
     accessWidener?: string;
+    accessTransformerFiles?: string[];
     nestedJars?: string[];
     entrypointClasses: string[];
   }> {
@@ -312,6 +342,7 @@ export class ModAnalyzerService {
     entrypoints: ModEntrypoint[];
     mixinConfigFiles: string[];
     accessWidener?: string;
+    accessTransformerFiles?: string[];
     nestedJars?: string[];
     entrypointClasses: string[];
   } {
@@ -563,7 +594,7 @@ export class ModAnalyzerService {
   }
 
   /**
-   * Parse Forge/NeoForge mod metadata (simplified TOML parsing)
+   * Parse Forge/NeoForge mod metadata (array-table TOML blocks + fallbacks)
    */
   private parseForgeMetadata(
     zip: AdmZip,
@@ -586,6 +617,7 @@ export class ModAnalyzerService {
     entrypoints: ModEntrypoint[];
     mixinConfigFiles: string[];
     accessWidener?: string;
+    accessTransformerFiles?: string[];
     nestedJars?: string[];
     entrypointClasses: string[];
   } {
@@ -601,55 +633,120 @@ export class ModAnalyzerService {
     const dependencies: ModDependency[] = [];
     let minecraft = '*';
     let loaderVersion: string | undefined;
+    const accessTransformerFiles: string[] = [];
+    const mixinConfigFiles: string[] = [];
 
     if (entry) {
       const content = entry.getData().toString('utf8');
+      const parsed = parseForgeModToml(content);
 
-      // Simple TOML parsing for key fields
-      const modIdMatch = content.match(/modId\s*=\s*"([^"]+)"/);
-      if (modIdMatch) id = modIdMatch[1];
-
-      const versionMatch = content.match(/version\s*=\s*"([^"]+)"/);
-      if (versionMatch) version = versionMatch[1];
-
-      const nameMatch = content.match(/displayName\s*=\s*"([^"]+)"/);
-      if (nameMatch) name = nameMatch[1];
-
-      const descMatch = content.match(/description\s*=\s*'''([^']+)'''/s);
-      if (descMatch) description = descMatch[1].trim();
-
-      const authorsMatch = content.match(/authors\s*=\s*"([^"]+)"/);
-      if (authorsMatch) {
-        authors = authorsMatch[1].split(',').map((a) => ({ name: a.trim() }));
+      for (const f of parsed.accessTransformerFiles) {
+        if (!accessTransformerFiles.includes(f)) {
+          accessTransformerFiles.push(f);
+        }
       }
 
-      const licenseMatch = content.match(/license\s*=\s*"([^"]+)"/);
-      if (licenseMatch) license = licenseMatch[1];
-
-      // Parse dependencies section
-      const mcVersionMatch = content.match(
-        /\[\[dependencies\.[^\]]+\]\][\s\S]*?modId\s*=\s*"minecraft"[\s\S]*?versionRange\s*=\s*"\[([^\]]+)\]"/,
-      );
-      if (mcVersionMatch) {
-        minecraft = mcVersionMatch[1];
+      for (const c of parsed.mixinConfigs) {
+        if (!mixinConfigFiles.includes(c)) {
+          mixinConfigFiles.push(c);
+        }
       }
 
-      const loaderMatch = content.match(
-        /\[\[dependencies\.[^\]]+\]\][\s\S]*?modId\s*=\s*"(forge|neoforge)"[\s\S]*?versionRange\s*=\s*"\[([^\]]+)\]"/,
+      for (const d of parsed.dependencies) {
+        dependencies.push(this.forgeTomlDependencyToMod(d));
+      }
+
+      const mcDep = parsed.dependencies.find((d) => d.modId === 'minecraft');
+      if (mcDep) {
+        minecraft = mcDep.versionRange;
+      }
+
+      const loaderDep = parsed.dependencies.find(
+        (d) => d.modId === 'neoforge' || d.modId === 'forge',
       );
-      if (loaderMatch) {
-        loaderVersion = loaderMatch[2];
+      if (loaderDep) {
+        loaderVersion = loaderDep.versionRange;
+      }
+
+      const pm = parsed.primaryMod;
+      if (pm?.modId) {
+        id = pm.modId;
+      }
+      if (pm?.version) {
+        version = pm.version;
+      }
+      if (pm?.displayName) {
+        name = pm.displayName;
+      }
+      if (pm?.description) {
+        description = pm.description;
+      }
+      if (pm?.authors) {
+        authors = pm.authors.split(',').map((a) => ({ name: a.trim() }));
+      }
+      if (pm?.license) {
+        license = pm.license;
+      }
+
+      if (!description) {
+        const descMatch = content.match(/description\s*=\s*'''([\s\S]*?)'''/);
+        if (descMatch) {
+          description = descMatch[1].trim();
+        }
+      }
+      if (id === 'unknown') {
+        const modIdMatch = content.match(/modId\s*=\s*"([^"]+)"/);
+        if (modIdMatch) {
+          id = modIdMatch[1];
+        }
+      }
+      if (version === '0.0.0') {
+        const versionMatch = content.match(/version\s*=\s*"([^"]+)"/);
+        if (versionMatch) {
+          version = versionMatch[1];
+        }
+      }
+      if (!name) {
+        const nameMatch = content.match(/displayName\s*=\s*"([^"]+)"/);
+        if (nameMatch) {
+          name = nameMatch[1];
+        }
+      }
+      if (authors.length === 0) {
+        const authorsMatch = content.match(/authors\s*=\s*"([^"]+)"/);
+        if (authorsMatch) {
+          authors = authorsMatch[1].split(',').map((a) => ({ name: a.trim() }));
+        }
+      }
+      if (!license) {
+        const licenseMatch = content.match(/license\s*=\s*"([^"]+)"/);
+        if (licenseMatch) {
+          license = licenseMatch[1];
+        }
+      }
+      if (minecraft === '*' && !mcDep) {
+        const mcVersionMatch = content.match(
+          /\[\[dependencies\.[^\]]+\]\][\s\S]*?modId\s*=\s*"minecraft"[\s\S]*?versionRange\s*=\s*"([^"]+)"/,
+        );
+        if (mcVersionMatch) {
+          minecraft = mcVersionMatch[1];
+        }
+      }
+      if (!loaderVersion && !loaderDep) {
+        const loaderMatch = content.match(
+          /\[\[dependencies\.[^\]]+\]\][\s\S]*?modId\s*=\s*"(forge|neoforge)"[\s\S]*?versionRange\s*=\s*"([^"]+)"/,
+        );
+        if (loaderMatch) {
+          loaderVersion = loaderMatch[2];
+        }
       }
     }
 
-    // Check for mixin configs in META-INF
-    const mixinConfigFiles: string[] = [];
-    const mixinsEntry = zip.getEntry(`META-INF/${id}.mixins.json`);
-    if (mixinsEntry) {
+    const mixinsById = zip.getEntry(`META-INF/${id}.mixins.json`);
+    if (mixinsById && !mixinConfigFiles.includes(`META-INF/${id}.mixins.json`)) {
       mixinConfigFiles.push(`META-INF/${id}.mixins.json`);
     }
 
-    // Also check root for common patterns
     for (const e of zip.getEntries()) {
       if (e.entryName.endsWith('.mixins.json') && !mixinConfigFiles.includes(e.entryName)) {
         mixinConfigFiles.push(e.entryName);
@@ -672,6 +769,7 @@ export class ModAnalyzerService {
       entrypoints: [],
       mixinConfigFiles,
       accessWidener: undefined,
+      accessTransformerFiles: accessTransformerFiles.length > 0 ? accessTransformerFiles : undefined,
       nestedJars: undefined,
       entrypointClasses: [],
     };
@@ -746,38 +844,6 @@ export class ModAnalyzerService {
       return value.substring(0, methodSep);
     }
     return value;
-  }
-
-  /**
-   * Parse mixin configuration files
-   */
-  private parseMixinConfigs(zip: AdmZip, configFiles: string[]): ModMixinConfig[] {
-    const configs: ModMixinConfig[] = [];
-
-    for (const configFile of configFiles) {
-      const entry = zip.getEntry(configFile);
-      if (!entry) {
-        logger.warn(`Mixin config not found: ${configFile}`);
-        continue;
-      }
-
-      try {
-        const content = entry.getData().toString('utf8');
-        const config = JSON.parse(content) as MixinConfigJson;
-
-        configs.push({
-          configFile,
-          package: config.package,
-          mixins: config.mixins,
-          clientMixins: config.client,
-          serverMixins: config.server,
-        });
-      } catch (e) {
-        logger.warn(`Failed to parse mixin config: ${configFile}`, e);
-      }
-    }
-
-    return configs;
   }
 
   /**

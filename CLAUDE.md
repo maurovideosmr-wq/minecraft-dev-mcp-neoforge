@@ -200,11 +200,12 @@ Tests the entire pipeline end-to-end:
 **Test Configuration** (`vitest.config.ts`):
 - `watch: false` - Exit after tests finish (don't watch for changes)
 - `testTimeout: 600000` - 10 minute timeout for long operations
-- Tests use version `1.21.10` as the test target
+- Integration tests use `__tests__/test-constants.ts` (e.g. `TEST_VERSION`).
 
 **Running Tests**:
 ```bash
-npm test  # Runs all integration tests
+npm test                  # Default: quick suite (no big downloads; safe offline)
+npm run test:integration # Full suite: JARs, mappings, decompile, registry-heavy tests
 ```
 
 ## Common Tasks
@@ -309,10 +310,13 @@ The code should work automatically, but be aware:
 
 ### Phase 3 Tools (Mod Analysis)
 16. **`analyze_mod_jar`** - Analyze third-party mod JAR files
-17. **`decompile_mod_jar`** - Decompile mod JARs to readable Java source
+17. **`decompile_mod_jar`** - Decompile mod JARs to readable Java source (`modLoader` + optional `mapping`; NeoForge defaults to mojmap)
 18. **`search_mod_code`** - Search decompiled mod source code
 19. **`index_mod`** - Create full-text search index for mod source
 20. **`search_mod_indexed`** - Fast FTS5 search on indexed mod source
+21. **`validate_access_transformer`** - Parse/validate Forge/NeoForge Access Transformer files (not Fabric access widener)
+22. **`decompile_neoforge_api`** - Download NeoForge universal JAR and decompile API sources
+23. **`index_neoforge_api`** / **`search_neoforge_api`** - FTS5 index and search on decompiled NeoForge API
 
 #### `analyze_mod_jar` Tool
 
@@ -385,7 +389,8 @@ Decompiles a mod JAR file to readable Java source code.
 ```typescript
 {
   jarPath: string;      // Path to mod JAR (WSL or Windows path)
-  mapping: 'yarn' | 'mojmap';  // Mapping type JAR uses
+  mapping?: 'yarn' | 'mojmap';  // If omitted, use modLoader: neoforge → mojmap, fabric → yarn
+  modLoader?: 'fabric' | 'neoforge';  // Default fabric; only affects mapping when mapping omitted
   modId?: string;       // Optional, auto-detected if not provided
   modVersion?: string;  // Optional, auto-detected if not provided
 }

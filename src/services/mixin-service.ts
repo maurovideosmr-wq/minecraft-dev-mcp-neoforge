@@ -11,6 +11,7 @@ import AdmZip from 'adm-zip';
 import { getCacheManager } from '../cache/cache-manager.js';
 import type {
   MappingType,
+  ModMixinConfig,
   MixinAccessor,
   MixinClass,
   MixinInjection,
@@ -22,9 +23,26 @@ import type {
   MixinValidationWarning,
 } from '../types/minecraft.js';
 import { MixinParseError } from '../utils/errors.js';
+import { parseForgeModToml } from '../utils/forge-toml-blocks.js';
 import { logger } from '../utils/logger.js';
+import {
+  collectMixinClassNamesFromConfigs,
+  parseMixinConfigsFromZip,
+} from './mixin-config-reader.js';
 import { getDecompiledPath } from '../utils/paths.js';
 import { getDecompileService } from './decompile-service.js';
+
+export type MixinJarValidationLevel = 'full' | 'partial' | 'none';
+
+/** Result of scanning a mod JAR for mixin configs and optional .java sources */
+export interface MixinJarAnalysis {
+  validationLevel: MixinJarValidationLevel;
+  configPaths: string[];
+  parsedConfigs: ModMixinConfig[];
+  mixinClassNamesFromConfig: string[];
+  mixins: MixinClass[];
+  note?: string;
+}
 
 /**
  * Mixin Analysis Service
@@ -320,57 +338,107 @@ export class MixinService {
   }
 
   /**
-   * Parse all mixins from a mod JAR file
+   * Discover mixin JSON paths from Fabric / NeoForge / Forge metadata and globs.
    */
-  async parseMixinsFromJar(jarPath: string): Promise<MixinClass[]> {
-    if (!existsSync(jarPath)) {
-      throw new MixinParseError(jarPath, `JAR file not found: ${jarPath}`);
+  discoverMixinConfigPaths(zip: AdmZip): string[] {
+    const paths: string[] = [];
+    const add = (p: string) => {
+      if (p && !paths.includes(p)) {
+        paths.push(p);
+      }
+    };
+
+    const neo = zip.getEntry('META-INF/neoforge.mods.toml');
+    if (neo) {
+      for (const c of parseForgeModToml(neo.getData().toString('utf8')).mixinConfigs) {
+        add(c);
+      }
+    }
+    const forgeToml = zip.getEntry('META-INF/mods.toml');
+    if (forgeToml) {
+      for (const c of parseForgeModToml(forgeToml.getData().toString('utf8')).mixinConfigs) {
+        add(c);
+      }
     }
 
-    const mixins: MixinClass[] = [];
-    const zip = new AdmZip(jarPath);
-    const entries = zip.getEntries();
-
-    // Look for fabric.mod.json to find mixin configs (for future use)
-    const fabricModJson = entries.find((e) => e.entryName === 'fabric.mod.json');
+    const fabricModJson = zip.getEntry('fabric.mod.json');
     if (fabricModJson) {
       try {
-        const content = JSON.parse(fabricModJson.getData().toString('utf8'));
-        if (content.mixins) {
-          // Mixin configs found - could be used for targeted parsing
-          logger.debug(`Found mixin configs in fabric.mod.json: ${JSON.stringify(content.mixins)}`);
+        const content = JSON.parse(fabricModJson.getData().toString('utf8')) as {
+          mixins?: Array<string | { config: string }>;
+        };
+        for (const m of content.mixins ?? []) {
+          add(typeof m === 'string' ? m : m.config);
         }
       } catch {
         logger.warn('Failed to parse fabric.mod.json');
       }
     }
 
-    // Parse all Java files looking for @Mixin
-    for (const entry of entries) {
-      if (entry.entryName.endsWith('.java')) {
-        try {
-          const source = entry.getData().toString('utf8');
-          const mixin = this.parseMixinSource(source, entry.entryName);
-          if (mixin) {
-            mixins.push(mixin);
-          }
-        } catch (error) {
-          logger.warn(`Failed to parse mixin from ${entry.entryName}:`, error);
-        }
+    for (const e of zip.getEntries()) {
+      if (e.entryName.endsWith('.mixins.json')) {
+        add(e.entryName);
       }
     }
 
-    // Also check for decompiled class files (if remapped)
-    for (const entry of entries) {
-      if (entry.entryName.endsWith('.class') && !entry.entryName.includes('$')) {
-        // Try to find corresponding source
-        const sourceName = entry.entryName.replace('.class', '.java');
-        const sourceEntry = entries.find((e) => e.entryName === sourceName);
-        if (sourceEntry) {
+    return paths;
+  }
+
+  /**
+   * Scan a mod JAR: mixin configs, class names from JSON, and @Mixin parsers for any .java sources.
+   */
+  async analyzeMixinsFromJar(jarPath: string): Promise<MixinJarAnalysis> {
+    if (!existsSync(jarPath)) {
+      throw new MixinParseError(jarPath, `JAR file not found: ${jarPath}`);
+    }
+
+    const zip = new AdmZip(jarPath);
+    const configPaths = this.discoverMixinConfigPaths(zip);
+    const parsedConfigs = parseMixinConfigsFromZip(zip, configPaths);
+    const mixinClassNamesFromConfig = collectMixinClassNamesFromConfigs(parsedConfigs);
+
+    const mixins: MixinClass[] = [];
+    for (const entry of zip.getEntries()) {
+      if (!entry.entryName.endsWith('.java')) {
+        continue;
+      }
+      try {
+        const source = entry.getData().toString('utf8');
+        const mixin = this.parseMixinSource(source, entry.entryName);
+        if (mixin) {
+          mixins.push(mixin);
         }
+      } catch (error) {
+        logger.warn(`Failed to parse mixin from ${entry.entryName}:`, error);
       }
     }
 
+    let validationLevel: MixinJarValidationLevel = 'none';
+    let note: string | undefined;
+
+    if (mixins.length > 0) {
+      validationLevel = 'full';
+    } else if (mixinClassNamesFromConfig.length > 0 || configPaths.length > 0) {
+      validationLevel = 'partial';
+      note =
+        'No .java mixin sources in this JAR; classes are listed from mixin config JSON only. For full validation, point analyze_mixin at your mod sources directory or decompile the JAR first.';
+    }
+
+    return {
+      validationLevel,
+      configPaths,
+      parsedConfigs,
+      mixinClassNamesFromConfig,
+      mixins,
+      note,
+    };
+  }
+
+  /**
+   * Parse all mixins from a mod JAR file (Java sources only; use analyzeMixinsFromJar for configs)
+   */
+  async parseMixinsFromJar(jarPath: string): Promise<MixinClass[]> {
+    const { mixins } = await this.analyzeMixinsFromJar(jarPath);
     return mixins;
   }
 

@@ -445,7 +445,12 @@ export interface RankedSearchResult extends SearchIndexEntry {
  */
 
 /** Documentation source */
-export type DocSource = 'fabric_wiki' | 'minecraft_wiki' | 'javadoc' | 'parchment';
+export type DocSource =
+  | 'fabric_wiki'
+  | 'minecraft_wiki'
+  | 'javadoc'
+  | 'parchment'
+  | 'neoforged_docs';
 
 /** Documentation entry */
 export interface DocumentationEntry {
@@ -496,6 +501,8 @@ export interface ModDependency {
   type: DependencyType;
   /** Is mandatory */
   mandatory: boolean;
+  /** Forge/NeoForge dependency side when declared */
+  side?: 'CLIENT' | 'SERVER' | 'BOTH';
 }
 
 /** Mod entrypoint */
@@ -629,6 +636,9 @@ export interface ModAnalysisResult {
   /** Access widener file (Fabric) */
   accessWidener?: string;
 
+  /** Access Transformer resource paths (Forge / NeoForge), from neoforge.mods.toml / mods.toml */
+  accessTransformerFiles?: string[];
+
   /** Class analysis */
   classes: {
     /** Total class count */
@@ -650,7 +660,8 @@ export interface ModAnalysisResult {
   rawMetadata?: {
     fabricModJson?: unknown;
     quiltModJson?: unknown;
-    modsToml?: unknown;
+    /** META-INF/neoforge.mods.toml or mods.toml raw text when Forge/NeoForge */
+    modsToml?: string;
     mixinConfigs?: Record<string, unknown>;
   };
 }

@@ -1,3 +1,4 @@
+import { unlink } from 'node:fs/promises';
 import { dirname } from 'node:path';
 import {
   MOJANG_VERSION_MANIFEST_URL,
@@ -62,30 +63,75 @@ export class MojangDownloader {
   }
 
   /**
+   * Download a versioned JAR, verify SHA-1, and on mismatch delete the file,
+   * invalidate cached version.json, and retry (handles CDN hiccups / bad partial files).
+   */
+  private async downloadAndVerifyVersionedAsset(options: {
+    version: string;
+    destination: string;
+    label: string;
+    getDownload: (vj: VersionJson) => { url: string; sha1: string };
+    onProgress?: (downloaded: number, total: number) => void;
+  }): Promise<void> {
+    const { version, destination, label, getDownload, onProgress } = options;
+    const maxAttempts = 3;
+    let lastUrl = '';
+    let lastMismatch = '';
+
+    for (let attempt = 0; attempt < maxAttempts; attempt++) {
+      if (attempt > 0) {
+        this.versionJsonCache.delete(version);
+        try {
+          await unlink(destination);
+        } catch {
+          // missing or already removed
+        }
+        const waitMs = 1000 * attempt;
+        logger.warn(
+          `Retrying ${label} for ${version} (attempt ${attempt + 1}/${maxAttempts}) after ${waitMs}ms`,
+        );
+        await new Promise((r) => setTimeout(r, waitMs));
+      }
+
+      const versionJson = await this.getVersionJson(version);
+      const download = getDownload(versionJson);
+      lastUrl = download.url;
+
+      logger.info(`Downloading Minecraft ${version} ${label}`);
+      await downloadFile(download.url, destination, { onProgress });
+
+      logger.info('Verifying file integrity (SHA-1)');
+      const actualSha1 = await computeFileSha1(destination);
+      if (actualSha1 === download.sha1) {
+        return;
+      }
+      lastMismatch = `expected ${download.sha1}, got ${actualSha1}`;
+      logger.warn(`SHA-1 mismatch for ${version} ${label}: ${lastMismatch}`);
+    }
+
+    throw new DownloadError(
+      lastUrl,
+      `SHA-1 mismatch after ${maxAttempts} attempts: ${lastMismatch}`,
+    );
+  }
+
+  /**
    * Download Minecraft client JAR
    */
   async downloadClientJar(
     version: string,
     onProgress?: (downloaded: number, total: number) => void,
   ): Promise<string> {
-    const versionJson = await this.getVersionJson(version);
-    const clientDownload = getClientDownload(versionJson);
-
     const destination = getVersionJarPath(version);
     ensureDir(dirname(destination));
 
-    logger.info(`Downloading Minecraft ${version} client JAR`);
-    await downloadFile(clientDownload.url, destination, { onProgress });
-
-    // Verify SHA-1
-    logger.info('Verifying JAR integrity');
-    const actualSha1 = await computeFileSha1(destination);
-    if (actualSha1 !== clientDownload.sha1) {
-      throw new DownloadError(
-        clientDownload.url,
-        `SHA-1 mismatch: expected ${clientDownload.sha1}, got ${actualSha1}`,
-      );
-    }
+    await this.downloadAndVerifyVersionedAsset({
+      version,
+      destination,
+      label: 'client JAR',
+      getDownload: getClientDownload,
+      onProgress,
+    });
 
     logger.info(`Client JAR verified: ${destination}`);
     return destination;
@@ -98,24 +144,16 @@ export class MojangDownloader {
     version: string,
     onProgress?: (downloaded: number, total: number) => void,
   ): Promise<string> {
-    const versionJson = await this.getVersionJson(version);
-    const serverDownload = getServerDownload(versionJson);
-
     const destination = getServerJarPath(version);
     ensureDir(dirname(destination));
 
-    logger.info(`Downloading Minecraft ${version} server JAR`);
-    await downloadFile(serverDownload.url, destination, { onProgress });
-
-    // Verify SHA-1
-    logger.info('Verifying server JAR integrity');
-    const actualSha1 = await computeFileSha1(destination);
-    if (actualSha1 !== serverDownload.sha1) {
-      throw new DownloadError(
-        serverDownload.url,
-        `SHA-1 mismatch: expected ${serverDownload.sha1}, got ${actualSha1}`,
-      );
-    }
+    await this.downloadAndVerifyVersionedAsset({
+      version,
+      destination,
+      label: 'server JAR',
+      getDownload: getServerDownload,
+      onProgress,
+    });
 
     logger.info(`Server JAR verified: ${destination}`);
     return destination;

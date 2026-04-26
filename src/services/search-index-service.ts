@@ -12,7 +12,12 @@ import { getCacheManager } from '../cache/cache-manager.js';
 import type { MappingType, RankedSearchResult } from '../types/minecraft.js';
 import { SearchIndexError } from '../utils/errors.js';
 import { logger } from '../utils/logger.js';
-import { getCacheDir, getDecompiledModPath, getDecompiledPath } from '../utils/paths.js';
+import {
+  getCacheDir,
+  getDecompiledModPath,
+  getDecompiledNeoforgePath,
+  getDecompiledPath,
+} from '../utils/paths.js';
 
 /**
  * Search Index Service using SQLite FTS5
@@ -120,6 +125,30 @@ export class SearchIndexService {
         indexed_at INTEGER NOT NULL,
         file_count INTEGER NOT NULL,
         PRIMARY KEY (mod_id, mod_version, mapping)
+      );
+    `);
+
+    db.exec(`
+      CREATE VIRTUAL TABLE IF NOT EXISTS neoforge_search_index USING fts5(
+        mc_version,
+        neo_version,
+        class_name,
+        file_path,
+        entry_type,
+        symbol,
+        context,
+        line,
+        tokenize='porter unicode61'
+      );
+    `);
+
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS neoforge_index_metadata (
+        mc_version TEXT NOT NULL,
+        neo_version TEXT NOT NULL,
+        indexed_at INTEGER NOT NULL,
+        file_count INTEGER NOT NULL,
+        PRIMARY KEY (mc_version, neo_version)
       );
     `);
   }
@@ -958,6 +987,274 @@ export class SearchIndexService {
       }));
     } catch (error) {
       logger.error('FTS5 search failed:', error);
+      return [];
+    }
+  }
+
+  /**
+   * NeoForge API index
+   */
+  isNeoforgeApiIndexed(mcVersion: string, neoVersion: string): boolean {
+    const db = this.getDb();
+    return !!db
+      .prepare('SELECT 1 FROM neoforge_index_metadata WHERE mc_version = ? AND neo_version = ?')
+      .get(mcVersion, neoVersion);
+  }
+
+  getLatestIndexedNeoForgeVersion(mcVersion: string): string | undefined {
+    const db = this.getDb();
+    const row = db
+      .prepare(
+        'SELECT neo_version FROM neoforge_index_metadata WHERE mc_version = ? ORDER BY indexed_at DESC LIMIT 1',
+      )
+      .get(mcVersion) as { neo_version: string } | undefined;
+    return row?.neo_version;
+  }
+
+  clearNeoforgeApiIndex(mcVersion: string, neoVersion: string): void {
+    const db = this.getDb();
+    db.prepare(
+      'DELETE FROM neoforge_search_index WHERE mc_version = ? AND neo_version = ?',
+    ).run(mcVersion, neoVersion);
+    db.prepare(
+      'DELETE FROM neoforge_index_metadata WHERE mc_version = ? AND neo_version = ?',
+    ).run(mcVersion, neoVersion);
+  }
+
+  async indexNeoforgeApi(
+    mcVersion: string,
+    neoForgeVersion: string,
+    onProgress?: (current: number, total: number, className: string) => void,
+  ): Promise<{ fileCount: number; duration: number }> {
+    const startTime = Date.now();
+    const decompiledPath = getDecompiledNeoforgePath(mcVersion, neoForgeVersion);
+    if (!existsSync(decompiledPath)) {
+      throw new SearchIndexError(
+        mcVersion,
+        neoForgeVersion,
+        `NeoForge decompiled sources not found at ${decompiledPath}. Run decompile_neoforge_api first.`,
+      );
+    }
+
+    logger.info(`Indexing NeoForge API ${neoForgeVersion} (MC ${mcVersion}) from ${decompiledPath}`);
+    this.clearNeoforgeApiIndex(mcVersion, neoForgeVersion);
+
+    const db = this.getDb();
+    const insertStmt = db.prepare(`
+      INSERT INTO neoforge_search_index (mc_version, neo_version, class_name, file_path, entry_type, symbol, context, line)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+    `);
+
+    const files: string[] = [];
+    const walkDir = (dir: string) => {
+      try {
+        const entries = readdirSync(dir, { withFileTypes: true });
+        for (const entry of entries) {
+          const fullPath = join(dir, entry.name);
+          if (entry.isDirectory()) {
+            walkDir(fullPath);
+          } else if (entry.name.endsWith('.java')) {
+            files.push(fullPath);
+          }
+        }
+      } catch (error) {
+        logger.warn(`Failed to read directory ${dir}:`, error);
+      }
+    };
+    walkDir(decompiledPath);
+
+    const insertMany = db.transaction(
+      (
+        entries: Array<{
+          className: string;
+          filePath: string;
+          entryType: string;
+          symbol: string;
+          context: string;
+          line: number;
+        }>,
+      ) => {
+        for (const entry of entries) {
+          insertStmt.run(
+            mcVersion,
+            neoForgeVersion,
+            entry.className,
+            entry.filePath,
+            entry.entryType,
+            entry.symbol,
+            entry.context,
+            entry.line,
+          );
+        }
+      },
+    );
+
+    let processedCount = 0;
+    const batchSize = 100;
+    for (let i = 0; i < files.length; i += batchSize) {
+      const batch = files.slice(i, Math.min(i + batchSize, files.length));
+      const entries: Array<{
+        className: string;
+        filePath: string;
+        entryType: string;
+        symbol: string;
+        context: string;
+        line: number;
+      }> = [];
+
+      for (const filePath of batch) {
+        try {
+          const relativePath = filePath.substring(decompiledPath.length + 1).replace(/\\/g, '/');
+          const className = relativePath.replace(/\//g, '.').replace('.java', '');
+          const source = readFileSync(filePath, 'utf8');
+
+          entries.push({
+            className,
+            filePath: relativePath,
+            entryType: 'class',
+            symbol: className.split('.').pop() || className,
+            context: this.extractClassContext(source),
+            line: 1,
+          });
+
+          const members = this.extractMembers(source);
+          for (const member of members) {
+            entries.push({
+              className,
+              filePath: relativePath,
+              entryType: member.type,
+              symbol: member.name,
+              context: member.context,
+              line: member.line,
+            });
+          }
+
+          processedCount++;
+          if (onProgress && processedCount % 50 === 0) {
+            onProgress(processedCount, files.length, className);
+          }
+        } catch (error) {
+          logger.warn(`Failed to index ${filePath}:`, error);
+        }
+      }
+
+      insertMany(entries);
+    }
+
+    db.prepare(
+      'INSERT OR REPLACE INTO neoforge_index_metadata (mc_version, neo_version, indexed_at, file_count) VALUES (?, ?, ?, ?)',
+    ).run(mcVersion, neoForgeVersion, Date.now(), files.length);
+
+    const duration = Date.now() - startTime;
+    logger.info(`Indexed NeoForge API ${files.length} files in ${duration}ms`);
+    return { fileCount: files.length, duration };
+  }
+
+  searchNeoforgeApi(
+    query: string,
+    mcVersion: string,
+    neoForgeVersion: string,
+    options: {
+      types?: Array<'class' | 'method' | 'field'>;
+      limit?: number;
+      includeContext?: boolean;
+    } = {},
+  ): RankedSearchResult[] {
+    const { types, limit = 100, includeContext = true } = options;
+
+    if (!this.isNeoforgeApiIndexed(mcVersion, neoForgeVersion)) {
+      throw new SearchIndexError(
+        mcVersion,
+        neoForgeVersion,
+        'NeoForge API not indexed. Run index_neoforge_api first.',
+      );
+    }
+
+    const db = this.getDb();
+    const sanitizedQuery = query.replace(/['"]/g, '').replace(/[*]/g, ' ').trim();
+    if (!sanitizedQuery) {
+      return [];
+    }
+
+    let typeFilter = '';
+    if (types && types.length > 0) {
+      const typeList = types.map((t) => `'${t}'`).join(', ');
+      typeFilter = `AND entry_type IN (${typeList})`;
+    }
+
+    const searchQuery = sanitizedQuery
+      .split(/\s+/)
+      .filter((term) => term.length > 0)
+      .join(' OR ');
+
+    let sql = `
+      SELECT
+        mc_version,
+        neo_version,
+        class_name,
+        file_path,
+        entry_type,
+        symbol,
+        context,
+        line,
+        rank
+      FROM neoforge_search_index
+      WHERE neoforge_search_index MATCH ?
+        AND mc_version = ?
+        AND neo_version = ?
+        ${typeFilter}
+      ORDER BY rank
+      LIMIT ?
+    `;
+
+    if (!includeContext) {
+      sql = `
+        SELECT
+          mc_version,
+          neo_version,
+          class_name,
+          file_path,
+          entry_type,
+          symbol,
+          context,
+          line,
+          rank
+        FROM neoforge_search_index
+        WHERE symbol MATCH ?
+          AND mc_version = ?
+          AND neo_version = ?
+          ${typeFilter}
+        ORDER BY rank
+        LIMIT ?
+      `;
+    }
+
+    try {
+      const rows = db.prepare(sql).all(searchQuery, mcVersion, neoForgeVersion, limit) as Array<{
+        mc_version: string;
+        neo_version: string;
+        class_name: string;
+        file_path: string;
+        entry_type: string;
+        symbol: string;
+        context: string;
+        line: number;
+        rank: number;
+      }>;
+
+      return rows.map((row) => ({
+        entryType: row.entry_type as 'class' | 'method' | 'field',
+        className: row.class_name,
+        symbol: row.symbol,
+        filePath: row.file_path,
+        line: row.line,
+        context: row.context,
+        version: row.mc_version,
+        mapping: row.neo_version,
+        score: -row.rank,
+      }));
+    } catch (error) {
+      logger.error('NeoForge FTS5 search failed:', error);
       return [];
     }
   }

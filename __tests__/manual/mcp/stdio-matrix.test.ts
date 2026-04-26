@@ -55,7 +55,7 @@ describe('Manual MCP Stdio Matrix', () => {
     const tools = await session.client.listTools();
     const resources = await session.client.listResources();
 
-    expect(tools.tools.length).toBe(20);
+    expect(tools.tools.length).toBe(21);
     expect(resources.resources.length).toBeGreaterThan(0);
   }, 30000);
 

@@ -28,7 +28,7 @@ describe('MCP Stdio Server Smoke', () => {
   it('should list tools over stdio transport', async () => {
     const result = await session.client.listTools();
 
-    expect(result.tools.length).toBe(20);
+    expect(result.tools.length).toBe(21);
     const toolNames = result.tools.map((tool) => tool.name);
     expect(toolNames).toContain('decompile_minecraft_version');
     expect(toolNames).toContain('get_minecraft_source');
